@@ -189,13 +189,11 @@ class MarketContextFeatures:
         self.config = config
         self.correlation_config = config['features']['correlation']
         
-    def calculate_market_correlations(self, stock_data: Dict[str, pd.DataFrame], 
-                                    symbol: str) -> pd.DataFrame:
+    def calculate_market_correlations(self, df: pd.DataFrame, 
+                                    stock_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         """Calculate correlations with market indices."""
-        if symbol not in stock_data:
-            return pd.DataFrame()
+        # --- FIX: This function now receives 'df' and modifies it directly ---
         
-        stock_df = stock_data[symbol].copy()
         market_indices = self.config['data']['market_indices']
         
         for index in market_indices:
@@ -203,27 +201,25 @@ class MarketContextFeatures:
                 index_data = stock_data[index]
                 
                 # Align dates
-                common_dates = stock_df.index.intersection(index_data.index)
+                common_dates = df.index.intersection(index_data.index)
                 if len(common_dates) < self.correlation_config['market_corr_period']:
                     continue
                 
                 # Calculate rolling correlation
                 period = self.correlation_config['market_corr_period']
-                stock_returns = stock_df.loc[common_dates, 'Returns']
+                stock_returns = df.loc[common_dates, 'Returns']
                 index_returns = index_data.loc[common_dates, 'Returns']
                 
                 correlation = stock_returns.rolling(window=period).corr(index_returns)
-                stock_df[f'corr_{index.replace("^", "").replace("-", "_")}'] = correlation
+                df[f'corr_{index.replace("^", "").replace("-", "_")}'] = correlation
         
-        return stock_df
+        return df
     
-    def calculate_sector_correlations(self, stock_data: Dict[str, pd.DataFrame], 
-                                    symbol: str) -> pd.DataFrame:
+    def calculate_sector_correlations(self, df: pd.DataFrame, 
+                                    stock_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         """Calculate correlations with sector ETFs."""
-        if symbol not in stock_data:
-            return pd.DataFrame()
-        
-        stock_df = stock_data[symbol].copy()
+        # --- FIX: This function now receives 'df' and modifies it directly ---
+
         sector_etfs = self.config['data']['sector_etfs']
         
         for etf in sector_etfs:
@@ -231,27 +227,26 @@ class MarketContextFeatures:
                 etf_data = stock_data[etf]
                 
                 # Align dates
-                common_dates = stock_df.index.intersection(etf_data.index)
+                common_dates = df.index.intersection(etf_data.index)
                 if len(common_dates) < self.correlation_config['sector_corr_period']:
                     continue
                 
                 # Calculate rolling correlation
                 period = self.correlation_config['sector_corr_period']
-                stock_returns = stock_df.loc[common_dates, 'Returns']
+                stock_returns = df.loc[common_dates, 'Returns']
                 etf_returns = etf_data.loc[common_dates, 'Returns']
                 
                 correlation = stock_returns.rolling(window=period).corr(etf_returns)
-                stock_df[f'sector_corr_{etf}'] = correlation
+                df[f'sector_corr_{etf}'] = correlation
         
-        return stock_df
+        return df
     
-    def calculate_peer_correlations(self, stock_data: Dict[str, pd.DataFrame], 
+    def calculate_peer_correlations(self, df: pd.DataFrame, 
+                                  stock_data: Dict[str, pd.DataFrame], 
                                   symbol: str) -> pd.DataFrame:
         """Calculate correlations with peer stocks."""
-        if symbol not in stock_data:
-            return pd.DataFrame()
+        # --- FIX: This function now receives 'df' and modifies it directly ---
         
-        stock_df = stock_data[symbol].copy()
         symbols = self.config['data']['symbols']
         
         # Calculate average correlation with other stocks
@@ -264,13 +259,13 @@ class MarketContextFeatures:
             peer_data = stock_data[peer_symbol]
             
             # Align dates
-            common_dates = stock_df.index.intersection(peer_data.index)
-            if len(common_dates) < self.correlation_config['peer_corr_period']:
+            common_dates = df.index.intersection(peer_data.index)
+            if len(common_dates) < self.config['features']['correlation']['peer_corr_period']:
                 continue
             
             # Calculate rolling correlation
-            period = self.correlation_config['peer_corr_period']
-            stock_returns = stock_df.loc[common_dates, 'Returns']
+            period = self.config['features']['correlation']['peer_corr_period']
+            stock_returns = df.loc[common_dates, 'Returns']
             peer_returns = peer_data.loc[common_dates, 'Returns']
             
             correlation = stock_returns.rolling(window=period).corr(peer_returns)
@@ -279,10 +274,10 @@ class MarketContextFeatures:
         if peer_correlations:
             # Average peer correlation
             peer_corr_df = pd.concat(peer_correlations, axis=1)
-            stock_df['avg_peer_correlation'] = peer_corr_df.mean(axis=1)
-            stock_df['peer_correlation_std'] = peer_corr_df.std(axis=1)
+            df['avg_peer_correlation'] = peer_corr_df.mean(axis=1)
+            df['peer_correlation_std'] = peer_corr_df.std(axis=1)
         
-        return stock_df
+        return df
 
 
 class LearnableTemporalWeights(nn.Module):
@@ -386,7 +381,19 @@ class FeatureEngineer:
         
         # Convert news to DataFrame
         news_df = pd.DataFrame(news_data)
-        news_df['date'] = pd.to_datetime(news_df['date']).dt.date
+        
+        # --- FIX: Convert date from string/datetime object ---
+        # Ensure 'date' column is datetime
+        try:
+            news_df['date'] = pd.to_datetime(news_df['date'])
+            news_df['date'] = news_df['date'].dt.date
+        except Exception as e:
+            logger.error(f"Error converting news dates: {e}. News data might be corrupted.")
+            price_data['daily_sentiment'] = 0.0
+            price_data['news_count'] = 0
+            price_data['sentiment_std'] = 0.0
+            return price_data
+        # ----------------------------------------------------
         
         # Aggregate news by date
         daily_news = news_df.groupby('date').agg({
@@ -438,10 +445,11 @@ class FeatureEngineer:
         # Calculate technical indicators
         df = self.technical_indicators.calculate_all_indicators(df)
         
-        # Add market context features
-        df = self.market_context.calculate_market_correlations(stock_data, symbol)
-        df = self.market_context.calculate_sector_correlations(stock_data, symbol)
-        df = self.market_context.calculate_peer_correlations(stock_data, symbol)
+        # --- FIX: Pass 'df' to the context functions, not just 'stock_data' ---
+        # This ensures features are ADDED to the df, not replacing it.
+        df = self.market_context.calculate_market_correlations(df, stock_data)
+        df = self.market_context.calculate_sector_correlations(df, stock_data)
+        df = self.market_context.calculate_peer_correlations(df, stock_data, symbol)
         
         # Align and add news features
         symbol_news = news_data.get(symbol, [])
@@ -458,7 +466,7 @@ class FeatureEngineer:
         
         df = df.iloc[initial_rows:]
         
-        logger.info(f"Generated {len(df.columns)} features for {symbol}")
+        logger.info(f"Generated {len(df.columns)} total features for {symbol}")
         
         return df
     

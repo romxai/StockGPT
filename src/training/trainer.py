@@ -19,6 +19,9 @@ import json
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, classification_report
 from torch.utils.data import DataLoader, TensorDataset
 import warnings
+import sys # Added for path manipulation in main
+import traceback # Added for debug logging
+
 warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
@@ -34,6 +37,9 @@ class EarlyStopping:
         self.best_score = None
         self.counter = 0
         self.best_weights = None
+        # --- DEBUG: Flag to indicate if best weights were restored ---
+        self.restored_weights = False 
+        # -----------------------------------------------------------
     
     def __call__(self, score: float, model: nn.Module) -> bool:
         """
@@ -46,23 +52,47 @@ class EarlyStopping:
         Returns:
             True if training should stop, False otherwise
         """
+        stop_training = False
+        # --- DEBUG: Check if score is NaN ---
+        if score is None or not np.isfinite(score):
+            logger.warning("EarlyStopping received non-finite score. Treating as no improvement.")
+            score = -float('inf') # Treat NaN/Inf as worst possible score
+        # -------------------------------------
+
         if self.best_score is None:
             self.best_score = score
             if self.restore_best_weights:
-                self.best_weights = model.state_dict().copy()
+                # --- DEBUG: Log weight saving ---
+                logger.debug(f"EarlyStopping: Saving initial best weights (score: {score:.4f}).")
+                # -------------------------------
+                self.best_weights = {k: v.cpu() for k, v in model.state_dict().items()} # Store on CPU
         elif score < self.best_score + self.min_delta:
             self.counter += 1
+            logger.debug(f"EarlyStopping counter: {self.counter}/{self.patience} (Score {score:.4f} did not improve over {self.best_score:.4f} by {self.min_delta})")
             if self.counter >= self.patience:
+                logger.info(f"Early stopping patience ({self.patience}) reached.")
                 if self.restore_best_weights and self.best_weights is not None:
-                    model.load_state_dict(self.best_weights)
-                return True
+                    # --- DEBUG: Log weight restoration ---
+                    logger.info("Restoring best model weights from early stopping.")
+                    try:
+                         # Ensure weights are moved to the correct device
+                         model.load_state_dict({k: v.to(model.parameters().__next__().device) for k, v in self.best_weights.items()})
+                         self.restored_weights = True
+                    except Exception as e:
+                         logger.error(f"Failed to restore best weights: {e}")
+                    # ------------------------------------
+                stop_training = True
         else:
+            logger.debug(f"EarlyStopping: Validation score improved to {score:.4f} from {self.best_score:.4f}.")
             self.best_score = score
             self.counter = 0
             if self.restore_best_weights:
-                self.best_weights = model.state_dict().copy()
+                 # --- DEBUG: Log weight saving ---
+                logger.debug(f"EarlyStopping: Saving new best weights (score: {score:.4f}).")
+                # -------------------------------
+                self.best_weights = {k: v.cpu() for k, v in model.state_dict().items()} # Store on CPU
         
-        return False
+        return stop_training
 
 
 class LearningRateScheduler:
@@ -71,8 +101,8 @@ class LearningRateScheduler:
     def __init__(self, optimizer: optim.Optimizer, warmup_steps: int, 
                  max_steps: int, base_lr: float, min_lr: float = 1e-6):
         self.optimizer = optimizer
-        self.warmup_steps = warmup_steps
-        self.max_steps = max_steps
+        self.warmup_steps = max(0, warmup_steps) # Ensure non-negative
+        self.max_steps = max(1, max_steps) # Ensure at least 1 step
         self.base_lr = base_lr
         self.min_lr = min_lr
         self.current_step = 0
@@ -81,19 +111,34 @@ class LearningRateScheduler:
         """Update learning rate."""
         self.current_step += 1
         
-        if self.current_step <= self.warmup_steps:
+        if self.warmup_steps > 0 and self.current_step <= self.warmup_steps:
             # Linear warmup
             lr = self.base_lr * (self.current_step / self.warmup_steps)
-        else:
+        # --- Check if annealing phase is valid ---
+        elif self.max_steps > self.warmup_steps: 
             # Cosine annealing
-            progress = (self.current_step - self.warmup_steps) / (self.max_steps - self.warmup_steps)
+            # Ensure denominator is positive
+            denominator = max(1, self.max_steps - self.warmup_steps) 
+            progress = (self.current_step - self.warmup_steps) / denominator
+            progress = min(progress, 1.0) # Cap progress at 1
             lr = self.min_lr + (self.base_lr - self.min_lr) * 0.5 * (1 + np.cos(np.pi * progress))
-        
+        # ------------------------------------------
+        else:
+            # No warmup or annealing needed/possible (e.g., max_steps <= warmup_steps)
+            lr = self.base_lr
+
+        # Ensure learning rate doesn't go below min_lr (except during potential initial phase)
+        lr = max(lr, self.min_lr)
+
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
     
     def get_lr(self) -> float:
         """Get current learning rate."""
+        # --- Handle case where optimizer has no param_groups ---
+        if not self.optimizer.param_groups:
+             return 0.0 # Or raise an error
+        # ----------------------------------------------------
         return self.optimizer.param_groups[0]['lr']
 
 
@@ -102,17 +147,34 @@ class StockDataset:
     
     def __init__(self, text_embeddings: np.ndarray, numerical_features: np.ndarray,
                  targets: np.ndarray, temporal_info: Optional[Dict[str, np.ndarray]] = None):
-        self.text_embeddings = torch.FloatTensor(text_embeddings)
-        self.numerical_features = torch.FloatTensor(numerical_features)
-        self.targets = torch.LongTensor(targets)
         
+        # --- DEBUG: Check input shapes and types ---
+        logger.debug(f"StockDataset init: text_embeddings shape={text_embeddings.shape}, dtype={text_embeddings.dtype}")
+        logger.debug(f"StockDataset init: numerical_features shape={numerical_features.shape}, dtype={numerical_features.dtype}")
+        logger.debug(f"StockDataset init: targets shape={targets.shape}, dtype={targets.dtype}")
         if temporal_info:
-            self.temporal_info = {
-                key: torch.FloatTensor(value) for key, value in temporal_info.items()
-            }
-        else:
-            self.temporal_info = None
-    
+            for k, v in temporal_info.items():
+                logger.debug(f"StockDataset init: temporal_info['{k}'] shape={v.shape}, dtype={v.dtype}")
+        # -------------------------------------------
+
+        # --- Convert to Tensors with explicit types ---
+        self.text_embeddings = torch.as_tensor(text_embeddings, dtype=torch.float32)
+        self.numerical_features = torch.as_tensor(numerical_features, dtype=torch.float32)
+        self.targets = torch.as_tensor(targets, dtype=torch.long) # Target labels should be Long
+        # ---------------------------------------------
+        
+        # Handle data types correctly for temporal info
+        self.temporal_info = None
+        if temporal_info:
+            self.temporal_info = {}
+            for key, value in temporal_info.items():
+                if key == 'event_categories':
+                    # Ensure categories are LongTensor for indexing
+                    self.temporal_info[key] = torch.as_tensor(value, dtype=torch.long)
+                else:
+                    # Other temporal info (like days_ago) can be FloatTensor
+                    self.temporal_info[key] = torch.as_tensor(value, dtype=torch.float32)
+
     def __len__(self):
         return len(self.targets)
     
@@ -124,33 +186,87 @@ class StockDataset:
         }
         
         if self.temporal_info:
-            item['temporal_info'] = {
-                key: value[idx] for key, value in self.temporal_info.items()
-            }
-        
+            # Make sure to handle potential missing keys gracefully if needed
+            item['temporal_info'] = {}
+            for key, value_tensor in self.temporal_info.items():
+                 # --- DEBUG: Add check for index out of bounds ---
+                 if idx < len(value_tensor):
+                     item['temporal_info'][key] = value_tensor[idx]
+                 else:
+                     logger.error(f"Index {idx} out of bounds for temporal key '{key}' with length {len(value_tensor)}")
+                     # Handle error: maybe return default value or raise error
+                     # For now, let it potentially raise IndexError later or handle in collate_fn
+                 # ---------------------------------------------
         return item
 
 
 def collate_fn(batch):
     """Custom collate function for DataLoader."""
-    text_embeddings = torch.stack([item['text_embeddings'] for item in batch])
-    numerical_features = torch.stack([item['numerical_features'] for item in batch])
-    targets = torch.stack([item['targets'] for item in batch])
-    
-    result = {
-        'text_embeddings': text_embeddings,
-        'numerical_features': numerical_features,
-        'targets': targets
-    }
-    
-    # Handle temporal info if present
-    if 'temporal_info' in batch[0]:
-        temporal_info = {}
-        for key in batch[0]['temporal_info'].keys():
-            temporal_info[key] = torch.stack([item['temporal_info'][key] for item in batch])
-        result['temporal_info'] = temporal_info
-    
-    return result
+    # --- DEBUG: Check if batch is empty ---
+    if not batch:
+        logger.warning("collate_fn received an empty batch.")
+        # Return empty tensors or dictionary of empty tensors
+        # Adjust shapes based on your model's expected input
+        return { 
+            'text_embeddings': torch.empty((0, 0, 0), dtype=torch.float), 
+            'numerical_features': torch.empty((0, 0, 0), dtype=torch.float),
+            'targets': torch.empty((0,), dtype=torch.long)
+        }
+    # -------------------------------------
+
+    try:
+        text_embeddings = torch.stack([item['text_embeddings'] for item in batch])
+        numerical_features = torch.stack([item['numerical_features'] for item in batch])
+        targets = torch.stack([item['targets'] for item in batch])
+        
+        result = {
+            'text_embeddings': text_embeddings,
+            'numerical_features': numerical_features,
+            'targets': targets
+        }
+        
+        # Handle temporal info if present and non-empty
+        if batch and 'temporal_info' in batch[0] and batch[0]['temporal_info']:
+            temporal_info = {}
+            # Iterate through keys present in the first item's temporal_info
+            for key in batch[0]['temporal_info'].keys():
+                # Ensure all items in the batch have this key before stacking
+                if all(key in item.get('temporal_info', {}) for item in batch):
+                    try:
+                        temporal_info[key] = torch.stack([item['temporal_info'][key] for item in batch])
+                    except Exception as e:
+                         logger.error(f"Error stacking temporal key '{key}': {e}. Skipping this key for the batch.")
+                         # --- DEBUG: Log shapes on error ---
+                         shapes = [item['temporal_info'][key].shape for item in batch if key in item.get('temporal_info', {})]
+                         logger.debug(f"Shapes for key '{key}': {shapes}")
+                         # ---------------------------------
+                else:
+                     logger.warning(f"Temporal key '{key}' missing in some items of the batch. Skipping.")
+            if temporal_info: # Only add if we successfully stacked something
+                 result['temporal_info'] = temporal_info
+        
+        return result
+
+    except Exception as collate_err:
+        logger.error(f"Error during collate_fn: {collate_err}")
+        # --- DEBUG: Log item details on error ---
+        for i, item in enumerate(batch):
+            logger.debug(f"Batch item {i}:")
+            for k, v in item.items():
+                if isinstance(v, torch.Tensor):
+                    logger.debug(f"  {k}: shape={v.shape}, dtype={v.dtype}")
+                elif isinstance(v, dict):
+                     logger.debug(f"  {k}:")
+                     for sub_k, sub_v in v.items():
+                          if isinstance(sub_v, torch.Tensor):
+                               logger.debug(f"    {sub_k}: shape={sub_v.shape}, dtype={sub_v.dtype}")
+                          else:
+                               logger.debug(f"    {sub_k}: {sub_v}")
+                else:
+                    logger.debug(f"  {k}: {v}")
+        # --------------------------------------
+        # Propagate error or return dummy batch
+        raise collate_err # Re-raise error to stop training
 
 
 class StockPredictorTrainer:
@@ -160,6 +276,7 @@ class StockPredictorTrainer:
         self.model = model
         self.config = config
         self.device = torch.device(config['training']['device'] if torch.cuda.is_available() else 'cpu')
+        logger.info(f"Using device: {self.device}")
         self.model.to(self.device)
         
         # Training parameters
@@ -170,19 +287,38 @@ class StockPredictorTrainer:
         self.gradient_clip_norm = config['training']['gradient_clip_norm']
         
         # Initialize optimizer
-        self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay
-        )
+        try:
+            self.optimizer = optim.AdamW(
+                self.model.parameters(),
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay
+            )
+        except ValueError as e:
+             logger.error(f"Error initializing optimizer: {e}. Check model parameters.")
+             raise
+        
+        # Calculate max_steps based on estimated total steps
+        # This is an approximation, might need adjustment if data size varies a lot
+        # Use a more reasonable default estimate or calculate later
+        estimated_train_size = self.config.get('training',{}).get('estimated_train_samples', 8000) # Default estimate
+        if self.batch_size > 0:
+            steps_per_epoch = estimated_train_size // self.batch_size
+        else:
+            steps_per_epoch = 1 # Avoid division by zero
+        calculated_max_steps = self.epochs * steps_per_epoch
         
         # Initialize scheduler
         self.scheduler = LearningRateScheduler(
             self.optimizer,
-            warmup_steps=config['training']['warmup_steps'],
-            max_steps=config['training']['max_steps'],
+            warmup_steps=config['training'].get('warmup_steps', 0), # Use .get for safety
+            # Use calculated_max_steps if max_steps is not provided or is unreasonably small
+            max_steps=max(config['training'].get('max_steps', 0), calculated_max_steps), 
             base_lr=self.learning_rate
         )
+        # --- Store the final max_steps used ---
+        self.final_max_steps = self.scheduler.max_steps 
+        # ---------------------------------------
+        logger.info(f"Scheduler initialized with warmup={config['training'].get('warmup_steps', 0)}, max_steps={self.final_max_steps}")
         
         # Early stopping
         self.early_stopping = EarlyStopping(
@@ -193,9 +329,14 @@ class StockPredictorTrainer:
         self.criterion = nn.CrossEntropyLoss()
         
         # Mixed precision training
-        self.use_mixed_precision = config['training']['mixed_precision']
-        if self.use_mixed_precision:
+        self.use_mixed_precision = config['training'].get('mixed_precision', False) # Use .get
+        self.scaler = None # Initialize scaler to None
+        if self.use_mixed_precision and self.device.type == 'cuda': # Check for CUDA
             self.scaler = torch.cuda.amp.GradScaler()
+            logger.info("Mixed precision training enabled.")
+        elif self.use_mixed_precision and self.device.type != 'cuda':
+             logger.warning("Mixed precision configured but not enabled (requires CUDA device).")
+             self.use_mixed_precision = False # Ensure it's disabled
         
         # Training history
         self.training_history = {
@@ -211,74 +352,124 @@ class StockPredictorTrainer:
                     sequence_length: int) -> Tuple[StockDataset, StockDataset]:
         """
         Prepare training and validation datasets.
-        
-        Args:
-            features_data: Dictionary of feature DataFrames per symbol
-            news_data: Dictionary of processed news data per symbol
-            sequence_length: Length of input sequences
-            
-        Returns:
-            Tuple of (train_dataset, val_dataset)
         """
         all_sequences = []
         all_targets = []
         all_text_embeddings = []
         all_temporal_info = []
         
+        processed_count = 0
+        skipped_count = 0
+        
         for symbol in features_data.keys():
-            if symbol not in news_data:
+            if symbol not in news_data or not isinstance(features_data[symbol], pd.DataFrame) or features_data[symbol].empty:
+                logger.warning(f"Skipping {symbol}: Missing/empty features or news data.")
+                skipped_count +=1
                 continue
             
             df = features_data[symbol]
             news = news_data[symbol]
             
-            # Create sequences
-            sequences, targets, text_emb, temporal = self._create_sequences(
-                df, news, sequence_length
-            )
-            
-            if len(sequences) > 0:
-                all_sequences.extend(sequences)
-                all_targets.extend(targets)
-                all_text_embeddings.extend(text_emb)
-                all_temporal_info.extend(temporal)
-        
+            if df.empty:
+                logger.warning(f"Skipping {symbol}: Feature DataFrame is empty.")
+                skipped_count += 1
+                continue
+                
+            try:
+                sequences, targets, text_emb, temporal = self._create_sequences(
+                    df, news, sequence_length
+                )
+                
+                if len(sequences) > 0:
+                    all_sequences.extend(sequences)
+                    all_targets.extend(targets)
+                    all_text_embeddings.extend(text_emb)
+                    all_temporal_info.extend(temporal)
+                    processed_count += 1
+                else:
+                    logger.warning(f"No valid sequences generated for {symbol}.")
+                    skipped_count += 1
+                    
+            except Exception as e:
+                logger.error(f"Error creating sequences for {symbol}: {e}")
+                logger.debug(traceback.format_exc()) # Log full traceback for debugging
+                skipped_count += 1
+
+        logger.info(f"Sequence creation summary: Processed symbols={processed_count}, Skipped symbols={skipped_count}")
+
         if not all_sequences:
-            raise ValueError("No valid sequences created from data")
+            raise ValueError("No valid sequences created from any symbol. Check data and feature engineering steps.")
         
         # Convert to arrays
-        X_num = np.array(all_sequences)
-        X_text = np.array(all_text_embeddings)
-        y = np.array(all_targets)
-        
+        try:
+            X_num = np.array(all_sequences, dtype=np.float32) 
+            X_text = np.array(all_text_embeddings, dtype=np.float32) 
+            y = np.array(all_targets, dtype=np.int64) # Ensure target type is suitable for LongTensor
+        except ValueError as e:
+             logger.error(f"Error converting sequence lists to numpy arrays: {e}")
+             # --- DEBUG: Log shapes of individual elements if conversion fails ---
+             logger.debug("Shapes of first few elements:")
+             for i in range(min(5, len(all_sequences))):
+                 logger.debug(f"  Sequence {i}: num={np.array(all_sequences[i]).shape}, text={np.array(all_text_embeddings[i]).shape}")
+             # ------------------------------------------------------------------
+             raise
+
         # Temporal info
         temporal_dict = None
-        if all_temporal_info and all_temporal_info[0]:
-            temporal_dict = {
-                'days_ago': np.array([t['days_ago'] for t in all_temporal_info]),
-                'event_categories': np.array([t['event_categories'] for t in all_temporal_info])
-            }
-        
+        if all_temporal_info and all_temporal_info[0] is not None: 
+            try:
+                 temporal_dict = {
+                     'days_ago': np.array([t['days_ago'] for t in all_temporal_info], dtype=np.float32),
+                     'event_categories': np.array([t['event_categories'] for t in all_temporal_info], dtype=np.int64) # Categories must be int/long
+                 }
+                 # --- DEBUG: Check temporal array shapes ---
+                 logger.debug(f"Temporal 'days_ago' shape: {temporal_dict['days_ago'].shape}")
+                 logger.debug(f"Temporal 'event_categories' shape: {temporal_dict['event_categories'].shape}")
+                 # -----------------------------------------
+            except Exception as e:
+                logger.error(f"Error processing temporal info into arrays: {e}. Disabling temporal features.")
+                logger.debug(traceback.format_exc())
+                temporal_dict = None 
+        else:
+             logger.info("No temporal information found or generated. Temporal features will be disabled.")
+
         # Train/validation split
         val_split = self.config['training']['val_split']
+        if not (0 < val_split < 1):
+            raise ValueError(f"Invalid validation split value: {val_split}. Must be between 0 and 1.")
+        
         split_idx = int(len(X_num) * (1 - val_split))
+        if split_idx == 0 or split_idx == len(X_num):
+             logger.warning(f"Train/validation split resulted in empty set (split_idx={split_idx}, total={len(X_num)}). Adjust val_split or data size.")
+             # Handle this case, e.g., raise error or adjust split
+             split_idx = max(1, min(len(X_num) - 1, split_idx)) # Ensure at least one sample in each if possible
+
+        indices = np.arange(len(X_num)) # Use simple indices for splitting
+        train_indices = indices[:split_idx]
+        val_indices = indices[split_idx:]
         
-        # Training data
-        train_dataset = StockDataset(
-            X_text[:split_idx],
-            X_num[:split_idx],
-            y[:split_idx],
-            {k: v[:split_idx] for k, v in temporal_dict.items()} if temporal_dict else None
-        )
-        
-        # Validation data
-        val_dataset = StockDataset(
-            X_text[split_idx:],
-            X_num[split_idx:],
-            y[split_idx:],
-            {k: v[split_idx:] for k, v in temporal_dict.items()} if temporal_dict else None
-        )
-        
+        logger.info(f"Splitting data: Train size={len(train_indices)}, Validation size={len(val_indices)}")
+
+        # Create datasets
+        try:
+            train_dataset = StockDataset(
+                X_text[train_indices],
+                X_num[train_indices],
+                y[train_indices],
+                {k: v[train_indices] for k, v in temporal_dict.items()} if temporal_dict else None
+            )
+            
+            val_dataset = StockDataset(
+                X_text[val_indices],
+                X_num[val_indices],
+                y[val_indices],
+                {k: v[val_indices] for k, v in temporal_dict.items()} if temporal_dict else None
+            )
+        except Exception as e:
+             logger.error(f"Error creating StockDataset objects: {e}")
+             logger.debug(traceback.format_exc())
+             raise
+
         logger.info(f"Created datasets: train={len(train_dataset)}, val={len(val_dataset)}")
         
         return train_dataset, val_dataset
@@ -291,54 +482,187 @@ class StockPredictorTrainer:
         text_embeddings = []
         temporal_info = []
         
-        # Get feature columns (exclude target and metadata)
-        feature_cols = [col for col in df.columns if col not in ['target', 'Symbol', 'future_return']]
+        # Explicitly select only NUMERICAL columns
+        exclude_cols = ['target', 'Symbol', 'future_return', 'sentiment_probs', 'date'] 
+        # --- Select numerical types robustly ---
+        numerical_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        # ---------------------------------------
+        feature_cols = [col for col in numerical_cols if col not in exclude_cols]
+        
+        if not feature_cols:
+             raise ValueError(f"No numerical feature columns found after exclusions in DataFrame for symbol {df['Symbol'].iloc[0] if 'Symbol' in df.columns else 'Unknown'}. Available columns: {df.columns.tolist()}")
+        logger.debug(f"Using {len(feature_cols)} numerical features for sequences: {feature_cols[:5]}...")
         
         # Create news embedding lookup by date
         news_lookup = {}
+        processed_news_count = 0
+        skipped_news_count = 0
         for news_item in news:
-            date = news_item['date'].date() if hasattr(news_item['date'], 'date') else news_item['date']
-            if date not in news_lookup:
-                news_lookup[date] = []
-            news_lookup[date].append(news_item)
-        
-        for i in range(sequence_length, len(df)):
-            # Numerical sequence
-            seq = df[feature_cols].iloc[i-sequence_length:i].values
-            target = df['target'].iloc[i]
+             item_date = news_item.get('date')
+             date_key = None
+             try:
+                 if isinstance(item_date, datetime):
+                     date_key = item_date.date()
+                 elif isinstance(item_date, pd.Timestamp):
+                     date_key = item_date.date()
+                 elif isinstance(item_date, str):
+                      date_key = datetime.fromisoformat(item_date).date()
+                 elif hasattr(item_date, 'date'): 
+                      date_key = item_date.date()
+                 else:
+                      raise TypeError(f"Unsupported date type {type(item_date)}")
+
+                 if date_key not in news_lookup:
+                     news_lookup[date_key] = []
+                 news_lookup[date_key].append(news_item)
+                 processed_news_count += 1
+             except Exception as parse_error:
+                 logger.warning(f"Could not parse/use date '{item_date}' in news lookup: {parse_error}")
+                 skipped_news_count += 1
+        logger.debug(f"News lookup created: {len(news_lookup)} dates, {processed_news_count} items processed, {skipped_news_count} skipped.")
+
+
+        # Ensure index is DatetimeIndex
+        if not isinstance(df.index, pd.DatetimeIndex):
+             logger.warning("DataFrame index is not DatetimeIndex. Converting...")
+             try:
+                 df.index = pd.to_datetime(df.index)
+             except Exception as e:
+                 raise ValueError(f"Could not convert DataFrame index to DatetimeIndex: {e}")
+
+        df_values = df[feature_cols].values.astype(np.float32) # Ensure float32
+        df_targets = df['target'].values
+        df_index_dates = df.index.date # Pre-calculate dates for lookup
+
+        # Check for NaNs/Infs *only* on the selected numerical columns
+        # --- More robust check for non-finite values ---
+        if not np.all(np.isfinite(df_values)):
+            non_finite_mask = ~np.isfinite(df_values)
+            rows_with_non_finite = np.where(non_finite_mask.any(axis=1))[0]
+            cols_with_non_finite = np.where(non_finite_mask.any(axis=0))[0]
+            logger.warning(f"{len(rows_with_non_finite)} rows contain non-finite (NaN/Inf) values in numerical features.")
+            logger.warning(f"Example indices: {rows_with_non_finite[:10]}...")
+            logger.warning(f"Columns with non-finite values (indices): {cols_with_non_finite}")
+            logger.warning(f"Columns names: {[feature_cols[i] for i in cols_with_non_finite]}")
             
-            if np.isnan(target) or np.any(np.isnan(seq)):
+            # Fill NaNs/Infs (replace Inf with large number before fillna)
+            df_filled = df[feature_cols].replace([np.inf, -np.inf], np.nan)
+            df_filled = df_filled.ffill().bfill().fillna(0)
+            df_values = df_filled.values.astype(np.float32) # Recast after filling
+            logger.info("Non-finite values in numerical features have been filled.")
+            if not np.all(np.isfinite(df_values)): # Double check
+                 raise ValueError("Non-finite values still present after attempting fill.")
+        # ---------------------------------------------
+
+        # Check for NaN/Inf in targets before loop
+        non_finite_target_mask = ~np.isfinite(df_targets)
+        non_finite_target_indices = np.where(non_finite_target_mask)[0]
+        if len(non_finite_target_indices) > 0:
+             logger.warning(f"{len(non_finite_target_indices)} non-finite (NaN/Inf) values found in target column. These sequences will be skipped.")
+
+        num_skipped_shape_mismatch = 0
+        num_skipped_nan_target = 0
+
+        # --- Efficiently iterate using range and slicing ---
+        num_samples = len(df)
+        for i in range(sequence_length, num_samples):
+            target_idx = i
+            start_idx = i - sequence_length
+            end_idx = i
+
+            target = df_targets[target_idx]
+            
+            # Check target validity first
+            if not np.isfinite(target):
+                num_skipped_nan_target += 1
                 continue
+                
+            # Numerical sequence slice
+            seq = df_values[start_idx:end_idx]
             
-            # Text embeddings sequence
+            # Text embeddings sequence and temporal info
             text_seq = []
             temporal_seq = {'days_ago': [], 'event_categories': []}
             
-            for j in range(i-sequence_length, i):
-                date = df.index[j].date()
-                if date in news_lookup:
-                    # Use first news item for the day (could be improved)
-                    news_item = news_lookup[date][0]
-                    text_seq.append(news_item.get('finbert_embedding', np.zeros(768)))
+            current_sequence_date = df_index_dates[target_idx] # Date of the target
+
+            valid_embedding_found = False # Track if we found any valid news embedding
+            for j in range(start_idx, end_idx):
+                lookup_date = df_index_dates[j]
+                days_ago_val = (current_sequence_date - lookup_date).days
+                
+                if lookup_date in news_lookup:
+                    news_item = news_lookup[lookup_date][0] # Using first news item
+                    embedding = news_item.get('finbert_embedding')
                     
-                    # Temporal information
-                    days_ago = (df.index[i].date() - date).days
-                    temporal_seq['days_ago'].append(days_ago)
-                    temporal_seq['event_categories'].append(0)  # Simplified
+                    if embedding is not None and isinstance(embedding, np.ndarray) and embedding.shape == (768,):
+                        text_seq.append(embedding.astype(np.float32)) 
+                        valid_embedding_found = True
+                    else:
+                        text_seq.append(np.zeros(768, dtype=np.float32)) 
+                    
+                    temporal_seq['days_ago'].append(max(0, days_ago_val)) 
+                    temporal_seq['event_categories'].append(0) # Placeholder category
                 else:
-                    # No news for this day
-                    text_seq.append(np.zeros(768))
-                    temporal_seq['days_ago'].append(0)
-                    temporal_seq['event_categories'].append(0)
+                    text_seq.append(np.zeros(768, dtype=np.float32)) 
+                    temporal_seq['days_ago'].append(max(0, days_ago_val)) # Use actual days ago even if no news
+                    temporal_seq['event_categories'].append(0) # Default category
             
-            sequences.append(seq)
-            targets.append(target)
-            text_embeddings.append(np.array(text_seq))
-            temporal_info.append({
-                'days_ago': np.array(temporal_seq['days_ago']),
-                'event_categories': np.array(temporal_seq['event_categories'])
-            })
-        
+            # --- Convert lists to numpy arrays for checking ---
+            try:
+                seq_np = np.array(seq) # Already a slice, should be np array
+                text_seq_np = np.array(text_seq, dtype=np.float32) # Ensure type
+                days_ago_np = np.array(temporal_seq['days_ago'], dtype=np.float32) # Ensure type
+                event_cat_np = np.array(temporal_seq['event_categories'], dtype=np.int64) # Ensure type
+
+                # --- Rigorous Shape and Content Check ---
+                shape_ok = (
+                    seq_np.shape == (sequence_length, len(feature_cols)) and
+                    text_seq_np.shape == (sequence_length, 768) and
+                    days_ago_np.shape == (sequence_length,) and
+                    event_cat_np.shape == (sequence_length,)
+                )
+                content_ok = (
+                    np.all(np.isfinite(seq_np)) and
+                    np.all(np.isfinite(text_seq_np)) and # Check embeddings too
+                    np.all(np.isfinite(days_ago_np)) 
+                    # event_cat_np should be integers, isfinite check not needed unless expecting NaNs
+                )
+
+                if shape_ok and content_ok:
+                    sequences.append(seq_np)
+                    targets.append(target) 
+                    text_embeddings.append(text_seq_np)
+                    temporal_info.append({
+                        'days_ago': days_ago_np,
+                        'event_categories': event_cat_np
+                    })
+                # --- Log skipped sequences ---
+                elif not shape_ok:
+                     num_skipped_shape_mismatch += 1
+                     if num_skipped_shape_mismatch < 5: # Log first few occurrences
+                          logger.warning(f"Skipping sequence ending at index {i} due to SHAPE mismatch.")
+                          # (Log detailed shapes as before if needed)
+                elif not content_ok:
+                     # This should ideally not happen due to earlier filling, but check anyway
+                     logger.warning(f"Skipping sequence ending at index {i} due to non-finite CONTENT.")
+                     # Log which array had issues if needed
+                     if not np.all(np.isfinite(seq_np)): logger.debug("Non-finite in seq_np")
+                     if not np.all(np.isfinite(text_seq_np)): logger.debug("Non-finite in text_seq_np")
+                     if not np.all(np.isfinite(days_ago_np)): logger.debug("Non-finite in days_ago_np")
+                # -------------------------
+
+            except Exception as check_err:
+                 logger.error(f"Error validating sequence arrays at index {i}: {check_err}")
+                 num_skipped_shape_mismatch += 1 # Count as shape/conversion error
+            # ----------------------------------------------------
+        # --- End of Loop ---
+
+        if num_skipped_shape_mismatch > 0:
+             logger.warning(f"Total sequences skipped due to shape/content issues: {num_skipped_shape_mismatch}")
+        if num_skipped_nan_target > 0:
+             logger.warning(f"Total sequences skipped due to NaN targets: {num_skipped_nan_target}")
+
         return sequences, targets, text_embeddings, temporal_info
     
     def train_epoch(self, train_loader: DataLoader) -> Tuple[float, float]:
@@ -347,65 +671,130 @@ class StockPredictorTrainer:
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
+        # --- DEBUG: Track NaNs ---
+        nan_loss_batches = 0
+        nan_logit_batches = 0
+        # --------------------------
         
         for batch_idx, batch in enumerate(train_loader):
             # Move to device
-            text_embeddings = batch['text_embeddings'].to(self.device)
-            numerical_features = batch['numerical_features'].to(self.device)
-            targets = batch['targets'].to(self.device)
-            
-            temporal_info = None
-            if 'temporal_info' in batch:
-                temporal_info = {
-                    key: value.to(self.device) for key, value in batch['temporal_info'].items()
-                }
-            
+            try:
+                text_embeddings = batch['text_embeddings'].to(self.device, non_blocking=True)
+                numerical_features = batch['numerical_features'].to(self.device, non_blocking=True)
+                targets = batch['targets'].to(self.device, non_blocking=True) # Targets should be Long
+                
+                temporal_info = None
+                if 'temporal_info' in batch and batch['temporal_info']: 
+                    temporal_info = {
+                        key: value.to(self.device, 
+                                      dtype=torch.long if key == 'event_categories' else torch.float, 
+                                      non_blocking=True) 
+                        for key, value in batch['temporal_info'].items()
+                    }
+            except Exception as e:
+                 logger.error(f"Error moving batch {batch_idx} to device: {e}. Skipping batch.")
+                 continue
+
             # Zero gradients
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True) 
             
             # Forward pass with mixed precision
-            if self.use_mixed_precision:
-                with torch.cuda.amp.autocast():
+            try:
+                if self.use_mixed_precision and self.scaler: # Check scaler exists
+                    with torch.cuda.amp.autocast():
+                        outputs = self.model(text_embeddings, numerical_features, temporal_info)
+                        # --- DEBUG: Check logits before loss ---
+                        if not torch.isfinite(outputs['logits']).all():
+                            logger.error(f"NaN/Inf logits detected BEFORE loss in batch {batch_idx} (Mixed Precision)")
+                            nan_logit_batches += 1
+                            raise RuntimeError("Non-finite logits detected") # Raise error to stop
+                        # --------------------------------------
+                        loss = self.criterion(outputs['logits'], targets.long()) 
+                    
+                    # Backward pass
+                    self.scaler.scale(loss).backward()
+                    
+                    # Gradient clipping
+                    if self.gradient_clip_norm > 0:
+                        self.scaler.unscale_(self.optimizer) 
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
+                    
+                    # Optimizer step
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else: # No mixed precision
                     outputs = self.model(text_embeddings, numerical_features, temporal_info)
-                    loss = self.criterion(outputs['logits'], targets)
-                
-                # Backward pass
-                self.scaler.scale(loss).backward()
-                
-                # Gradient clipping
-                if self.gradient_clip_norm > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
-                
-                # Optimizer step
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                outputs = self.model(text_embeddings, numerical_features, temporal_info)
-                loss = self.criterion(outputs['logits'], targets)
-                
-                # Backward pass
-                loss.backward()
-                
-                # Gradient clipping
-                if self.gradient_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
-                
-                # Optimizer step
-                self.optimizer.step()
-            
-            # Update scheduler
-            self.scheduler.step()
-            
-            # Calculate accuracy
-            _, predicted = torch.max(outputs['logits'], 1)
-            total_correct += (predicted == targets).sum().item()
-            total_samples += targets.size(0)
-            total_loss += loss.item()
+                    # --- DEBUG: Check logits before loss ---
+                    if not torch.isfinite(outputs['logits']).all():
+                        logger.error(f"NaN/Inf logits detected BEFORE loss in batch {batch_idx} (Standard Precision)")
+                        nan_logit_batches += 1
+                        raise RuntimeError("Non-finite logits detected") # Raise error to stop
+                    # --------------------------------------
+                    loss = self.criterion(outputs['logits'], targets.long()) 
+                    
+                    # Backward pass
+                    loss.backward()
+                    
+                    # Gradient clipping
+                    if self.gradient_clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
+                    
+                    # Optimizer step
+                    self.optimizer.step()
+
+                # --- DEBUG: Check loss AFTER backward but before scheduler step ---
+                if not torch.isfinite(loss):
+                     logger.error(f"NaN/Inf LOSS detected AFTER backward in batch {batch_idx}. LR={self.scheduler.get_lr():.6f}")
+                     nan_loss_batches += 1
+                     # Decide whether to continue or stop
+                     # Option 1: Log and continue (might recover)
+                     # Option 2: Raise error to stop training immediately
+                     raise RuntimeError("Non-finite loss detected") 
+                # -------------------------------------------------------------
+
+                # Update scheduler (AFTER optimizer step)
+                self.scheduler.step()
+
+            except RuntimeError as e: # Catch the explicit errors raised above
+                 logger.error(f"RuntimeError in batch {batch_idx}: {e}. Skipping batch.")
+                 # Clear gradients before next batch if skipping
+                 self.optimizer.zero_grad(set_to_none=True) 
+                 continue # Skip update calculations for this batch
+
+            except Exception as forward_err:
+                 logger.error(f"Unhandled error during forward/backward pass in batch {batch_idx}: {forward_err}")
+                 logger.debug(traceback.format_exc())
+                 continue # Skip update calculations for this batch
+
+
+            # Calculate accuracy (only if forward/backward succeeded)
+            with torch.no_grad(): 
+                _, predicted = torch.max(outputs['logits'], 1)
+                total_correct += (predicted == targets).sum().item()
+                total_samples += targets.size(0)
+                # Check loss again just in case, though checked earlier
+                if torch.isfinite(loss): 
+                    total_loss += loss.item() * targets.size(0) # Weighted loss
+                else:
+                    # Should not happen if RuntimeError was raised, but as safety
+                    logger.warning(f"Loss was non-finite in batch {batch_idx}, not adding to total_loss.")
+
+
+        # --- DEBUG: Report NaN counts for the epoch ---
+        if nan_logit_batches > 0:
+             logger.warning(f"Epoch Summary: Encountered NaN/Inf logits in {nan_logit_batches} batches.")
+        if nan_loss_batches > 0:
+             logger.warning(f"Epoch Summary: Encountered NaN/Inf loss in {nan_loss_batches} batches.")
+        # --------------------------------------------
+
+        avg_loss = total_loss / total_samples if total_samples > 0 else float('nan') # Return NaN if no samples
+        accuracy = total_correct / total_samples if total_samples > 0 else 0.0
         
-        avg_loss = total_loss / len(train_loader)
-        accuracy = total_correct / total_samples
-        
+        # --- DEBUG: Check avg_loss ---
+        if not np.isfinite(avg_loss):
+             logger.error(f"Average train loss for epoch is NaN/Inf! total_loss={total_loss}, total_samples={total_samples}")
+        # -----------------------------
+
         return avg_loss, accuracy
     
     def validate(self, val_loader: DataLoader) -> Tuple[float, float, Dict[str, float]]:
@@ -416,37 +805,82 @@ class StockPredictorTrainer:
         all_targets = []
         
         with torch.no_grad():
-            for batch in val_loader:
+            for batch_idx, batch in enumerate(val_loader):
                 # Move to device
-                text_embeddings = batch['text_embeddings'].to(self.device)
-                numerical_features = batch['numerical_features'].to(self.device)
-                targets = batch['targets'].to(self.device)
-                
-                temporal_info = None
-                if 'temporal_info' in batch:
-                    temporal_info = {
-                        key: value.to(self.device) for key, value in batch['temporal_info'].items()
-                    }
+                try:
+                    text_embeddings = batch['text_embeddings'].to(self.device, non_blocking=True)
+                    numerical_features = batch['numerical_features'].to(self.device, non_blocking=True)
+                    targets = batch['targets'].to(self.device, non_blocking=True) # Targets should be Long
+                    
+                    temporal_info = None
+                    if 'temporal_info' in batch and batch['temporal_info']: 
+                        temporal_info = {
+                            key: value.to(self.device, 
+                                          dtype=torch.long if key == 'event_categories' else torch.float,
+                                          non_blocking=True) 
+                            for key, value in batch['temporal_info'].items()
+                        }
+                except Exception as e:
+                     logger.error(f"Validation: Error moving batch {batch_idx} to device: {e}. Skipping batch.")
+                     continue
                 
                 # Forward pass
-                outputs = self.model(text_embeddings, numerical_features, temporal_info)
-                loss = self.criterion(outputs['logits'], targets)
-                
-                total_loss += loss.item()
-                
-                # Collect predictions
-                _, predicted = torch.max(outputs['logits'], 1)
-                all_predictions.extend(predicted.cpu().numpy())
-                all_targets.extend(targets.cpu().numpy())
-        
-        avg_loss = total_loss / len(val_loader)
+                try:
+                    # --- Use autocast even in validation if mixed precision was used in training ---
+                    # Although gradients aren't needed, it ensures consistent dtypes for model layers
+                    if self.use_mixed_precision:
+                         with torch.cuda.amp.autocast():
+                             outputs = self.model(text_embeddings, numerical_features, temporal_info)
+                             loss = self.criterion(outputs['logits'], targets.long()) 
+                    # -----------------------------------------------------------------------------
+                    else:
+                         outputs = self.model(text_embeddings, numerical_features, temporal_info)
+                         loss = self.criterion(outputs['logits'], targets.long()) 
+
+                    # --- DEBUG: Check validation loss ---
+                    if not torch.isfinite(loss):
+                         logger.warning(f"NaN/Inf validation loss detected in batch {batch_idx}.")
+                         # Skip adding to total loss, or handle as needed
+                    else:
+                         total_loss += loss.item() * targets.size(0) # Weighted loss
+                    # ------------------------------------
+                    
+                    # Collect predictions
+                    _, predicted = torch.max(outputs['logits'], 1)
+                    all_predictions.extend(predicted.cpu().numpy())
+                    all_targets.extend(targets.cpu().numpy())
+
+                except Exception as val_forward_err:
+                     logger.error(f"Validation Error during forward pass in batch {batch_idx}: {val_forward_err}")
+                     logger.debug(traceback.format_exc())
+                     # Skip batch if forward pass fails during validation
+                     continue
+
+        total_samples = len(all_targets)
+        avg_loss = total_loss / total_samples if total_samples > 0 else float('nan') # Return NaN if needed
         
         # Calculate metrics
+        if not all_targets or not all_predictions or total_samples == 0:
+             logger.warning("Validation set produced no valid targets or predictions.")
+             return avg_loss, 0.0, {'accuracy': 0.0, 'f1_score': 0.0, 'precision': 0.0, 'recall': 0.0}
+
+        # --- DEBUG: Check average validation loss ---
+        if not np.isfinite(avg_loss):
+             logger.error(f"Average validation loss is NaN/Inf! total_loss={total_loss}, total_samples={total_samples}")
+        # -----------------------------------------
+
         accuracy = accuracy_score(all_targets, all_predictions)
-        f1 = f1_score(all_targets, all_predictions, average='weighted')
-        precision = precision_score(all_targets, all_predictions, average='weighted', zero_division=0)
-        recall = recall_score(all_targets, all_predictions, average='weighted', zero_division=0)
-        
+        try:
+             f1 = f1_score(all_targets, all_predictions, average='weighted', zero_division=0)
+             precision = precision_score(all_targets, all_predictions, average='weighted', zero_division=0)
+             recall = recall_score(all_targets, all_predictions, average='weighted', zero_division=0)
+             # --- DEBUG: Log validation report ---
+             logger.debug(f"Validation classification report:\n{classification_report(all_targets, all_predictions, zero_division=0, target_names=['Down', 'Neutral', 'Up'])}") # Assuming 0,1,2
+             # ------------------------------------
+        except ValueError as metric_err:
+             logger.error(f"Error calculating validation metrics: {metric_err}. Only one class might be present.")
+             f1, precision, recall = 0.0, 0.0, 0.0
+
         metrics = {
             'accuracy': accuracy,
             'f1_score': f1,
@@ -458,93 +892,196 @@ class StockPredictorTrainer:
     
     def train(self, train_dataset: StockDataset, val_dataset: StockDataset) -> Dict[str, Any]:
         """Main training loop."""
+        if len(train_dataset) == 0 or len(val_dataset) == 0:
+             logger.error("Training or validation dataset is empty. Cannot start training.")
+             return { 'error': 'Empty dataset(s)' } # Simplified error return
+
         logger.info("Starting training...")
         
         # Create data loaders
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.batch_size,
-            shuffle=self.config['training']['shuffle'],
-            collate_fn=collate_fn,
-            num_workers=0  # Set to 0 for Windows compatibility
-        )
-        
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            collate_fn=collate_fn,
-            num_workers=0
-        )
-        
-        best_val_accuracy = 0.0
-        
-        for epoch in range(self.epochs):
-            # Training
-            train_loss, train_accuracy = self.train_epoch(train_loader)
-            
-            # Validation
-            val_loss, val_accuracy, val_metrics = self.validate(val_loader)
-            
-            # Update history
-            self.training_history['train_loss'].append(train_loss)
-            self.training_history['train_accuracy'].append(train_accuracy)
-            self.training_history['val_loss'].append(val_loss)
-            self.training_history['val_accuracy'].append(val_accuracy)
-            self.training_history['learning_rates'].append(self.scheduler.get_lr())
-            
-            # Log progress
-            logger.info(
-                f"Epoch {epoch+1}/{self.epochs} - "
-                f"Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.4f} - "
-                f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f} - "
-                f"LR: {self.scheduler.get_lr():.6f}"
+        try:
+            train_loader = DataLoader(
+                train_dataset, batch_size=self.batch_size, shuffle=self.config['training']['shuffle'],
+                collate_fn=collate_fn, num_workers=0, 
+                pin_memory=True if self.device.type == 'cuda' else False, 
+                drop_last=True # Drop last incomplete batch
             )
             
-            # Track best validation accuracy
-            if val_accuracy > best_val_accuracy:
-                best_val_accuracy = val_accuracy
-            
-            # Early stopping
-            if self.early_stopping(val_accuracy, self.model):
-                logger.info(f"Early stopping triggered at epoch {epoch+1}")
-                break
+            val_loader = DataLoader(
+                val_dataset, batch_size=self.batch_size, shuffle=False,
+                collate_fn=collate_fn, num_workers=0,
+                pin_memory=True if self.device.type == 'cuda' else False
+            )
+        except Exception as loader_err:
+             logger.error(f"Failed to create DataLoaders: {loader_err}")
+             logger.debug(traceback.format_exc())
+             return {'error': f'DataLoader creation failed: {loader_err}'}
+
+        # Re-calculate max_steps based on actual train_loader size
+        steps_per_epoch = len(train_loader)
+        if steps_per_epoch == 0:
+             logger.error("Train loader has zero length after drop_last=True. Check dataset size and batch size.")
+             return {'error': 'Train loader empty after drop_last'}
+             
+        calculated_max_steps = self.epochs * steps_per_epoch
+        # Update scheduler's max_steps if necessary
+        if self.final_max_steps < calculated_max_steps: # Use stored final_max_steps
+             logger.info(f"Updating scheduler max_steps from {self.final_max_steps} to {calculated_max_steps} based on loader size.")
+             self.scheduler.max_steps = calculated_max_steps
+             self.final_max_steps = calculated_max_steps # Update stored value
+
+
+        best_val_accuracy = -1.0 # Initialize to negative value
+        epochs_run = 0 
+        final_val_metrics = {} 
         
+        try: 
+            for epoch in range(self.epochs):
+                epochs_run += 1
+                logger.info(f"--- Starting Epoch {epoch+1}/{self.epochs} ---")
+                
+                # Training
+                train_loss, train_accuracy = self.train_epoch(train_loader)
+                
+                # --- Check for NaN/Inf in training results ---
+                if not np.isfinite(train_loss) or not np.isfinite(train_accuracy):
+                     logger.error(f"Epoch {epoch+1}: Training resulted in NaN/Inf (Loss: {train_loss}, Acc: {train_accuracy}). Stopping training.")
+                     raise RuntimeError("Training unstable (NaN/Inf detected)")
+                # --------------------------------------------
+
+                # Validation
+                val_loss, val_accuracy, val_metrics = self.validate(val_loader)
+                final_val_metrics = val_metrics 
+
+                # --- Check for NaN/Inf in validation results ---
+                if not np.isfinite(val_loss) or not np.isfinite(val_accuracy):
+                     logger.warning(f"Epoch {epoch+1}: Validation resulted in NaN/Inf (Loss: {val_loss}, Acc: {val_accuracy}). Continuing, but check data/model.")
+                     # Treat validation accuracy as very low for early stopping purposes
+                     val_accuracy_for_stopping = -1.0 
+                else:
+                     val_accuracy_for_stopping = val_accuracy
+                # ---------------------------------------------
+                
+                # Update history
+                self.training_history['train_loss'].append(train_loss)
+                self.training_history['train_accuracy'].append(train_accuracy)
+                self.training_history['val_loss'].append(val_loss)
+                self.training_history['val_accuracy'].append(val_accuracy)
+                self.training_history['learning_rates'].append(self.scheduler.get_lr())
+                
+                # Log progress
+                logger.info(
+                    f"Epoch {epoch+1}/{self.epochs} Completed - "
+                    f"Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.4f} | "
+                    f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f} | "
+                    f"LR: {self.scheduler.get_lr():.6f}"
+                )
+                
+                # Track best validation accuracy 
+                if val_accuracy_for_stopping > best_val_accuracy:
+                    logger.info(f"New best validation accuracy: {val_accuracy:.4f} (previous: {best_val_accuracy:.4f})")
+                    best_val_accuracy = val_accuracy # Store the actual accuracy
+                
+                # Early stopping (use val_accuracy_for_stopping which handles NaN)
+                if self.early_stopping(val_accuracy_for_stopping, self.model):
+                    # Early stopping log message is now inside EarlyStopping class
+                    break # Exit loop
+
+        except RuntimeError as train_err: # Catch the NaN/Inf error raised in train_epoch
+             logger.error(f"Stopping training due to runtime error: {train_err}")
+             return { # Return error state
+                 'best_val_accuracy': best_val_accuracy, 'final_val_metrics': final_val_metrics,
+                 'training_history': self.training_history, 'total_epochs': epochs_run,
+                 'error': f"Training stopped due to instability: {train_err}"
+             }
+        except Exception as train_loop_err:
+             logger.error(f"Unhandled error during training loop at epoch {epochs_run}: {train_loop_err}")
+             logger.error(traceback.format_exc())
+             return { # Return error state
+                 'best_val_accuracy': best_val_accuracy, 'final_val_metrics': final_val_metrics,
+                 'training_history': self.training_history, 'total_epochs': epochs_run,
+                 'error': f"Training loop failed: {train_loop_err}"
+             }
+        
+        # --- End of training loop ---
+
+        # Determine final best accuracy (if weights were restored, use the stored best score)
+        final_best_val_acc = self.early_stopping.best_score if self.early_stopping.restored_weights else best_val_accuracy
+
         final_results = {
-            'best_val_accuracy': best_val_accuracy,
-            'final_val_metrics': val_metrics,
+            'best_val_accuracy': final_best_val_acc,
+            'final_val_metrics': final_val_metrics,
             'training_history': self.training_history,
-            'total_epochs': epoch + 1
+            'total_epochs': epochs_run
         }
         
-        logger.info(f"Training completed. Best validation accuracy: {best_val_accuracy:.4f}")
-        
+        # --- Make log message clearer about which accuracy is reported ---
+        logger.info(f"Training completed. Best validation accuracy recorded during training: {final_best_val_acc:.4f} over {epochs_run} epochs.")
+        if self.early_stopping.restored_weights:
+             logger.info("Model state restored to the point of best validation accuracy.")
+        # -----------------------------------------------------------------
+
         return final_results
     
     def save_model(self, filepath: str, metadata: Optional[Dict] = None):
         """Save model checkpoint."""
+        # Ensure directory exists just before saving
+        try:
+             os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        except OSError as e:
+             logger.error(f"Could not create directory for saving model at {os.path.dirname(filepath)}: {e}")
+             return # Abort saving if directory cannot be created
+
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            # Save optimizer state only if needed for resuming training
+            # 'optimizer_state_dict': self.optimizer.state_dict(), 
             'training_history': self.training_history,
-            'config': self.config,
+            # Be cautious about saving the full config, might contain sensitive info or large objects
+            # Consider saving only relevant parts or parameters used for this specific model
+            'config': { 
+                 'model': self.config.get('model'), 
+                 'features': self.config.get('features'),
+                 # Add other relevant sections as needed
+                 },
             'metadata': metadata or {}
         }
         
-        torch.save(checkpoint, filepath)
-        logger.info(f"Model saved to {filepath}")
+        try:
+            torch.save(checkpoint, filepath)
+            logger.info(f"Model saved to {filepath}")
+        except Exception as e:
+            logger.error(f"Failed to save model to {filepath}: {e}")
+            logger.debug(traceback.format_exc())
+
     
     def load_model(self, filepath: str):
         """Load model checkpoint."""
-        checkpoint = torch.load(filepath, map_location=self.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.training_history = checkpoint.get('training_history', {})
-        
-        logger.info(f"Model loaded from {filepath}")
-        
-        return checkpoint.get('metadata', {})
+        if not os.path.exists(filepath):
+             logger.error(f"Model file not found: {filepath}")
+             raise FileNotFoundError(f"Model file not found: {filepath}")
+        try:
+            # --- Load checkpoint onto CPU first, then move model to device ---
+            checkpoint = torch.load(filepath, map_location='cpu') 
+            
+            # Load model state dict
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.to(self.device) # Move model to target device AFTER loading state
+            # ---------------------------------------------------------------
+
+            self.training_history = checkpoint.get('training_history', {})
+            loaded_config = checkpoint.get('config') # Get potentially saved config subset
+            if loaded_config:
+                 logger.info("Loaded configuration subset from checkpoint.")
+                 # You might want to compare or merge this with the current self.config if needed
+
+            logger.info(f"Model loaded from {filepath} and moved to {self.device}")
+            
+            return checkpoint.get('metadata', {})
+        except Exception as e:
+            logger.error(f"Failed to load model from {filepath}: {e}")
+            logger.debug(traceback.format_exc())
+            raise
 
 
 class OptunaOptimizer:
@@ -557,7 +1094,7 @@ class OptunaOptimizer:
         
         # Study settings
         self.n_trials = self.optimization_config['n_trials']
-        self.timeout = self.optimization_config['timeout']
+        self.timeout = self.optimization_config.get('timeout') # Use .get, might not be present
         self.study_name = self.optimization_config['study_name']
         
     def objective(self, trial: optuna.Trial, train_dataset: StockDataset, 
@@ -567,98 +1104,198 @@ class OptunaOptimizer:
         # Sample hyperparameters
         search_spaces = self.optimization_config['search_spaces']
         
-        learning_rate = trial.suggest_float('learning_rate', *search_spaces['learning_rate'], log=True)
-        batch_size = trial.suggest_categorical('batch_size', 
-                                              list(range(search_spaces['batch_size'][0], 
-                                                        search_spaces['batch_size'][1] + 1, 8)))
-        hidden_dim = trial.suggest_categorical('hidden_dim',
-                                              list(range(search_spaces['hidden_dim'][0],
-                                                        search_spaces['hidden_dim'][1] + 1, 32)))
-        num_layers = trial.suggest_int('num_layers', *search_spaces['num_layers'])
-        dropout = trial.suggest_float('dropout', *search_spaces['dropout'])
-        attention_heads = trial.suggest_categorical('attention_heads', [4, 8, 12, 16])
-        sequence_length = trial.suggest_categorical('sequence_length',
-                                                   list(range(search_spaces['sequence_length'][0],
-                                                            search_spaces['sequence_length'][1] + 1, 10)))
-        
+        try:
+            # Check if space definition is list (categorical) or tuple/list of 2 (range)
+            def _suggest(param_name, space):
+                if isinstance(space, list) and len(space) > 2 and all(isinstance(x, (int, float, str)) for x in space):
+                    return trial.suggest_categorical(param_name, space)
+                elif isinstance(space, (list, tuple)) and len(space) == 2:
+                    low, high = space
+                    if isinstance(low, int) and isinstance(high, int):
+                         # Check if range is small, suggest categorical instead if desired
+                         if high - low < 5: # Example threshold
+                              return trial.suggest_categorical(param_name, list(range(low, high + 1)))
+                         else:
+                              return trial.suggest_int(param_name, low, high)
+                    elif isinstance(low, float) and isinstance(high, float):
+                         log_scale = self.optimization_config.get('log_scale', {}).get(param_name, False)
+                         return trial.suggest_float(param_name, low, high, log=log_scale)
+                    else:
+                         raise TypeError(f"Unsupported range types for {param_name}: {type(low)}, {type(high)}")
+                else:
+                     raise TypeError(f"Invalid search space definition for {param_name}: {space}")
+
+            learning_rate = _suggest('learning_rate', search_spaces['learning_rate'])
+            batch_size = _suggest('batch_size', search_spaces['batch_size'])
+            hidden_dim = _suggest('hidden_dim', search_spaces['hidden_dim'])
+            num_layers = _suggest('num_layers', search_spaces['num_layers'])
+            dropout = _suggest('dropout', search_spaces['dropout'])
+            attention_heads = _suggest('attention_heads', search_spaces['attention_heads'])
+            # sequence_length = _suggest('sequence_length', search_spaces['sequence_length']) # Still complex
+
+        except Exception as suggest_err:
+             logger.error(f"Error suggesting parameters in trial {trial.number}: {suggest_err}")
+             raise # Re-raise to fail the trial
+
+        # Create a deep copy of the config to avoid modifying the original
+        import copy
+        trial_config = copy.deepcopy(self.config)
+
         # Update config with sampled parameters
-        trial_config = self.config.copy()
         trial_config['training']['learning_rate'] = learning_rate
         trial_config['training']['batch_size'] = batch_size
         trial_config['model']['hidden_dim'] = hidden_dim
         trial_config['model']['num_layers'] = num_layers
         trial_config['model']['dropout'] = dropout
         trial_config['model']['attention']['num_heads'] = attention_heads
-        trial_config['model']['sequence_length'] = sequence_length
-        
+        # trial_config['model']['sequence_length'] = sequence_length 
+
+        logger.info(f"--- Starting Optuna Trial {trial.number} ---")
+        logger.info(f"Parameters: lr={learning_rate:.6f}, bs={batch_size}, hidden={hidden_dim}, layers={num_layers}, dropout={dropout:.3f}, heads={attention_heads}")
+
         try:
-            # Create model with trial parameters
-            from ..models.hybrid_model import HybridStockPredictor
-            model = HybridStockPredictor(trial_config)
+            # Need to import here if HybridStockPredictor isn't globally available
+            # Ensure src is in path
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            src_dir = os.path.dirname(os.path.dirname(script_dir)) 
+            if src_dir not in sys.path: sys.path.insert(0, src_dir)
+            from models.hybrid_model import HybridStockPredictor # Relative import
             
-            # Create trainer
+            model = HybridStockPredictor(trial_config)
             trainer = StockPredictorTrainer(model, trial_config)
             
-            # Reduce epochs for optimization
-            trainer.epochs = min(20, trainer.epochs)  # Limit epochs for faster optimization
+            # Use specific epochs for HPO trials if defined
+            trainer.epochs = min(self.optimization_config.get('max_epochs_per_trial', 10), trainer.epochs) 
+            logger.info(f"Trial {trial.number}: Training for max {trainer.epochs} epochs.")
             
+            # Data preparation (assuming sequence length is fixed for HPO)
+            train_dataset_trial, val_dataset_trial = train_dataset, val_dataset
+
             # Train model
-            results = trainer.train(train_dataset, val_dataset)
+            results = trainer.train(train_dataset_trial, val_dataset_trial)
+
+            # --- Check for errors during training in the trial ---
+            if 'error' in results:
+                 logger.error(f"Trial {trial.number} training failed with error: {results['error']}")
+                 # Return a very low score for failed trials
+                 return -1.0 
+            # ----------------------------------------------------
             
-            # Return best validation accuracy
-            return results['best_val_accuracy']
+            # Report final best accuracy for pruning
+            final_best_accuracy = results['best_val_accuracy']
+            # --- Check if accuracy is valid before reporting ---
+            if final_best_accuracy is None or not np.isfinite(final_best_accuracy):
+                 logger.warning(f"Trial {trial.number} resulted in invalid accuracy ({final_best_accuracy}). Reporting as -1.0.")
+                 final_best_accuracy = -1.0 # Report as worst score
+            # -------------------------------------------------
+            trial.report(final_best_accuracy, step=results['total_epochs']) # Report final value at last epoch step
+            if trial.should_prune():
+                 logger.info(f"Trial {trial.number} pruned with accuracy {final_best_accuracy:.4f}.")
+                 raise optuna.exceptions.TrialPruned()
+
+            logger.info(f"--- Trial {trial.number} Finished: Accuracy = {final_best_accuracy:.4f} ---")
+            return final_best_accuracy
             
+        except optuna.exceptions.TrialPruned as pr:
+             logger.info(f"Trial {trial.number} pruned.")
+             raise pr # Re-raise TrialPruned
         except Exception as e:
-            logger.error(f"Trial failed: {str(e)}")
-            return 0.0  # Return worst possible score
+            logger.error(f"Trial {trial.number} failed unexpectedly: {str(e)}")
+            logger.error(traceback.format_exc())
+            return -1.0 # Return worse than any possible accuracy
     
     def optimize(self, train_dataset: StockDataset, val_dataset: StockDataset) -> Dict[str, Any]:
         """Run hyperparameter optimization."""
-        logger.info("Starting hyperparameter optimization with Optuna...")
+        logger.info(f"Starting hyperparameter optimization with Optuna for {self.n_trials} trials...")
         
         # Create study
+        seed = self.config.get('environment', {}).get('seed', 42)
         study = optuna.create_study(
             direction='maximize',
-            sampler=TPESampler(seed=42),
-            pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=10),
-            study_name=self.study_name
+            sampler=TPESampler(seed=seed), 
+            pruner=MedianPruner(
+                 n_startup_trials=self.optimization_config.get('pruner_startup_trials', 5), 
+                 n_warmup_steps=self.optimization_config.get('pruner_warmup_steps', 3), # Reduce warmup if epochs per trial is low
+                 interval_steps=1 
+                 ),
+            study_name=self.study_name,
+            # storage="sqlite:///optuna_study.db", # Example storage
+            # load_if_exists=True
         )
         
         # Run optimization
-        study.optimize(
-            lambda trial: self.objective(trial, train_dataset, val_dataset),
-            n_trials=self.n_trials,
-            timeout=self.timeout,
-            show_progress_bar=True
-        )
-        
+        try:
+            study.optimize(
+                lambda trial: self.objective(trial, train_dataset, val_dataset),
+                n_trials=self.n_trials,
+                timeout=self.timeout if self.timeout and self.timeout > 0 else None, 
+                show_progress_bar=True,
+                catch=(Exception,) # Catch all exceptions during a trial
+            )
+        except KeyboardInterrupt:
+             logger.warning("Optimization interrupted by user.")
+        except Exception as e:
+             logger.error(f"Optimization loop failed unexpectedly: {e}")
+             logger.error(traceback.format_exc())
+
+
         # Get results
-        best_params = study.best_params
-        best_value = study.best_value
-        
-        logger.info(f"Optimization completed. Best accuracy: {best_value:.4f}")
-        logger.info(f"Best parameters: {best_params}")
-        
+        best_params = {}
+        best_value = -1.0 # Default to worst score
+        try:
+            # Check if any COMPLETED trials exist before accessing best_trial
+            completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+            if completed_trials:
+                best_trial = study.best_trial
+                best_params = best_trial.params
+                best_value = best_trial.value
+                logger.info(f"Optimization completed.")
+                logger.info(f"Best Trial ({best_trial.number}): Accuracy = {best_value:.4f}")
+                logger.info(f"Best Parameters: {best_params}")
+            else:
+                 logger.warning("No trials completed successfully. Cannot determine best parameters.")
+
+        except Exception as e: # Catch potential errors accessing best_trial if study is empty/corrupt
+             logger.error(f"Error retrieving best trial results: {e}")
+
+
         # Save results
         results_path = os.path.join(self.config['reporting']['output_path'], 'optimization')
         os.makedirs(results_path, exist_ok=True)
         
-        results = {
+        # Recalculate trial states for summary
+        completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        pruned_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+        failed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]
+
+        opt_results_summary = {
             'best_params': best_params,
             'best_value': best_value,
-            'study': study,
-            'trials_df': study.trials_dataframe()
+            'n_trials_completed': len(completed_trials),
+            'n_trials_pruned': len(pruned_trials),
+            'n_trials_failed': len(failed_trials),
+            'total_trials_submitted': len(study.trials)
         }
         
-        # Save results
-        with open(os.path.join(results_path, 'optimization_results.json'), 'w') as f:
-            json.dump({
-                'best_params': best_params,
-                'best_value': best_value,
-                'n_trials': len(study.trials)
-            }, f, indent=2)
+        # Save results summary
+        try:
+            summary_file = os.path.join(results_path, f'{self.study_name}_summary.json')
+            with open(summary_file, 'w') as f:
+                json.dump(opt_results_summary, f, indent=2)
+            logger.info(f"Optimization summary saved to {summary_file}")
+        except Exception as e:
+             logger.error(f"Failed to save optimization JSON results: {e}")
         
-        return results
+        # Save trials dataframe
+        try:
+             trials_df = study.trials_dataframe()
+             trials_file = os.path.join(results_path, f'{self.study_name}_trials.csv')
+             trials_df.to_csv(trials_file, index=False)
+             logger.info(f"Optimization trials dataframe saved to {trials_file}")
+        except Exception as e: # Catch error if dataframe is empty or fails
+             logger.error(f"Failed to save optimization trials dataframe: {e}")
+
+        return opt_results_summary
 
 
 def main():
@@ -666,39 +1303,113 @@ def main():
     import yaml
     
     # Load configuration
-    with open('configs/config.yaml', 'r') as f:
-        config = yaml.safe_load(f)
-    
+    try:
+        # Assuming config is in ../configs relative to this script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(os.path.dirname(script_dir), 'configs', 'config.yaml')
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        logger.info(f"Config loaded from {config_path}")
+    except Exception as e:
+         print(f"Error loading config: {e}")
+         return
+
     # Set up logging
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, 
+                         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
     # Create dummy data for testing
-    n_samples = 1000
-    seq_len = 60
-    text_dim = 768
-    num_dim = 50
-    n_classes = 3
+    n_samples = 200 # Smaller sample for quick test
+    seq_len = config['model']['sequence_length'] 
+    text_dim = config['model']['embedding_dim'] 
+    num_dim = 83 # Match the number of features generated
+    n_classes = config['model']['output']['num_classes'] 
     
-    text_data = np.random.randn(n_samples, seq_len, text_dim)
-    num_data = np.random.randn(n_samples, seq_len, num_dim)
+    logger.info("Generating dummy data...")
+    num_data = np.random.randn(n_samples, seq_len, num_dim).astype(np.float32)
+    # --- Add some NaNs/Infs to test filling ---
+    num_data[0, 0, 0] = np.nan
+    num_data[1, 1, 1] = np.inf
+    # ----------------------------------------
+    text_data = np.random.randn(n_samples, seq_len, text_dim).astype(np.float32)
     targets = np.random.randint(0, n_classes, n_samples)
     
+    # Simulate temporal data
+    days_ago = np.random.randint(0, 30, (n_samples, seq_len)).astype(np.float32)
+    event_cats = np.random.randint(0, config['features']['temporal']['event_weight_categories'], (n_samples, seq_len)).astype(np.int64)
+    temporal_data = {'days_ago': days_ago, 'event_categories': event_cats}
+
     # Create datasets
-    train_dataset = StockDataset(text_data[:800], num_data[:800], targets[:800])
-    val_dataset = StockDataset(text_data[800:], num_data[800:], targets[800:])
+    logger.info("Creating datasets...")
+    split = int(0.8 * n_samples)
+    train_dataset = StockDataset(
+        text_data[:split], num_data[:split], targets[:split], 
+        {k:v[:split] for k,v in temporal_data.items()}
+        )
+    val_dataset = StockDataset(
+        text_data[split:], num_data[split:], targets[split:],
+        {k:v[split:] for k,v in temporal_data.items()}
+        )
+    logger.info(f"Datasets created: Train={len(train_dataset)}, Val={len(val_dataset)}")
+
     
     # Create model
-    from ..models.hybrid_model import HybridStockPredictor
-    model = HybridStockPredictor(config)
-    
+    try:
+        from models.hybrid_model import HybridStockPredictor # Relative import should work now
+        model = HybridStockPredictor(config)
+        logger.info("Model created successfully.")
+    except ImportError:
+         logger.error("Could not import HybridStockPredictor. Ensure it's in src/models/ and src is in PYTHONPATH.")
+         return
+    except Exception as e:
+         logger.error(f"Error creating model: {e}")
+         logger.error(traceback.format_exc())
+         return
+
     # Create trainer
-    trainer = StockPredictorTrainer(model, config)
-    trainer.epochs = 2  # Reduce for testing
+    # --- Temporarily modify config for test if needed ---
+    test_config = config.copy()
+    test_config['training']['epochs'] = 2
+    test_config['training']['learning_rate'] = 0.0001 # Use smaller LR for test
+    test_config['training']['mixed_precision'] = False # Disable MP for test
+    # ---------------------------------------------------
+    try:
+        trainer = StockPredictorTrainer(model, test_config)
+        logger.info("Trainer created successfully.")
+    except Exception as e:
+         logger.error(f"Error creating trainer: {e}")
+         logger.error(traceback.format_exc())
+         return
+
     
     # Test training
-    results = trainer.train(train_dataset, val_dataset)
-    print(f"Training completed. Best validation accuracy: {results['best_val_accuracy']:.4f}")
+    logger.info("Starting dummy training test...")
+    try:
+        results = trainer.train(train_dataset, val_dataset)
+        print("-" * 30)
+        print(f"Training completed. Best validation accuracy: {results.get('best_val_accuracy', 'N/A')}")
+        if isinstance(results.get('best_val_accuracy'), float):
+             print(f"Formatted Accuracy: {results.get('best_val_accuracy', -1.0):.4f}")
+        if 'error' in results:
+             print(f"Training finished with error: {results['error']}")
+        print("-" * 30)
+    except Exception as e:
+        logger.error(f"Training failed during test: {e}")
+        logger.error(traceback.format_exc())
 
 
 if __name__ == "__main__":
-    main()
+    # Add src directory to path to allow relative imports when run directly
+    import sys
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    src_dir = os.path.dirname(os.path.dirname(script_dir)) # Go up two levels
+    if src_dir not in sys.path:
+         sys.path.insert(0, src_dir)
+
+    # --- Set logging level to DEBUG for main test ---
+    logging.basicConfig(level=logging.DEBUG, 
+                         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # -----------------------------------------------
+    logger.info("Running basic trainer test with DEBUG logging...")
+    main() # Run the test function
+    logger.info("Basic trainer test finished.")

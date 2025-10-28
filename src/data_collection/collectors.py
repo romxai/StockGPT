@@ -14,6 +14,7 @@ import logging
 from typing import List, Dict, Optional, Tuple
 import os
 import pickle
+import json # Added for saving raw news
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +27,13 @@ class StockDataCollector:
         self.market_indices = config['data']['market_indices']
         self.sector_etfs = config['data']['sector_etfs']
         self.history_days = config['data']['history_days']
+        
+        # Define and create all data paths
         self.cache_dir = config['data']['cache_path']
+        self.raw_data_path = config['data']['raw_data_path']
+        self.raw_stock_dir = os.path.join(self.raw_data_path, 'stocks')
         os.makedirs(self.cache_dir, exist_ok=True)
+        os.makedirs(self.raw_stock_dir, exist_ok=True)
         
     def collect_stock_data(self, symbol: str, period: str = None, start: str = None, end: str = None) -> pd.DataFrame:
         """Collect OHLCV data for a single symbol."""
@@ -88,15 +94,25 @@ class StockDataCollector:
             data = self.collect_stock_data(symbol)
             if not data.empty:
                 all_data[symbol] = data
+                
+                # --- Save raw stock data ---
+                try:
+                    raw_file_path = os.path.join(self.raw_stock_dir, f"{symbol}.csv")
+                    data.to_csv(raw_file_path)
+                    logger.debug(f"Saved raw stock data to {raw_file_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to save raw stock data for {symbol}: {e}")
+                # ---------------------------------
+                
             time.sleep(0.1)  # Rate limiting
         
-        # Cache the data
+        # Cache the combined data
         try:
             with open(cache_file, 'wb') as f:
                 pickle.dump(all_data, f)
-            logger.info("Cached stock data")
+            logger.info(f"Cached combined stock data to {cache_file}")
         except Exception as e:
-            logger.warning(f"Error caching data: {str(e)}")
+            logger.warning(f"Error caching combined stock data: {str(e)}")
         
         return all_data
     
@@ -125,13 +141,18 @@ class StockDataCollector:
 
 
 class NewsDataCollector:
-    """Collects financial news from Yahoo Finance RSS feeds and web scraping."""
+    """Collects financial news from Yahoo Finance RSS feeds."""
     
     def __init__(self, config: Dict):
         self.config = config
         self.symbols = config['data']['symbols']
+        
+        # Define and create all data paths
         self.cache_dir = config['data']['cache_path']
+        self.raw_data_path = config['data']['raw_data_path']
+        self.raw_news_dir = os.path.join(self.raw_data_path, 'news')
         os.makedirs(self.cache_dir, exist_ok=True)
+        os.makedirs(self.raw_news_dir, exist_ok=True)
         
         # Yahoo Finance RSS feed URLs
         self.rss_urls = {
@@ -140,23 +161,36 @@ class NewsDataCollector:
             'tech': 'https://feeds.finance.yahoo.com/rss/2.0/category-tech',
         }
         
-        # Headers for web requests
+        # Added more keywords to search for
+        self.rss_keywords = [
+            "stocks", "market", "finance", "earnings", "technology", "economy"
+        ]
+        
+        # Headers for web requests (kept for RSS)
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
     
-    def collect_rss_news(self, symbol: str = None) -> List[Dict]:
-        """Collect news from Yahoo Finance RSS feeds."""
+    def collect_rss_news(self, symbol: str = None, keyword: str = None) -> List[Dict]:
+        """Collect news from Yahoo Finance RSS feeds by symbol, category, or keyword."""
         all_news = []
         
+        urls_to_fetch = {}
+
+        if symbol:
+            # Construct symbol-specific URL
+            urls_to_fetch[f'symbol_{symbol}'] = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}"
+        elif keyword:
+            # Construct keyword-specific URL (searches news)
+            urls_to_fetch[f'keyword_{keyword}'] = f"https://feeds.finance.yahoo.com/rss/v1/finance/News?query={keyword}"
+        else:
+            # Use predefined categories
+            urls_to_fetch = self.rss_urls
+
         try:
-            for category, url in self.rss_urls.items():
-                if symbol:
-                    # Construct symbol-specific URL
-                    symbol_url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}"
-                    feed = feedparser.parse(symbol_url)
-                else:
-                    feed = feedparser.parse(url)
+            for category, url in urls_to_fetch.items():
+                logger.debug(f"Fetching RSS feed from: {url}")
+                feed = feedparser.parse(url)
                 
                 for entry in feed.entries:
                     news_item = {
@@ -172,11 +206,11 @@ class NewsDataCollector:
                     # Parse published date
                     try:
                         if 'published_parsed' in entry:
-                            news_item['date'] = datetime(*entry.published_parsed[:6])
+                            news_item['date'] = datetime(*entry.published_parsed[:6]).isoformat()
                         else:
-                            news_item['date'] = datetime.now()
+                            news_item['date'] = datetime.now().isoformat()
                     except:
-                        news_item['date'] = datetime.now()
+                        news_item['date'] = datetime.now().isoformat()
                     
                     all_news.append(news_item)
                 
@@ -186,59 +220,6 @@ class NewsDataCollector:
             logger.error(f"Error collecting RSS news: {str(e)}")
         
         return all_news
-    
-    def collect_yahoo_finance_news(self, symbol: str) -> List[Dict]:
-        """Scrape news from Yahoo Finance stock page."""
-        news_items = []
-        
-        try:
-            url = f"https://finance.yahoo.com/quote/{symbol}/news"
-            response = requests.get(url, headers=self.headers, timeout=10)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Find news articles (structure may change, so we use multiple selectors)
-            news_containers = soup.find_all(['div', 'li'], {'class': lambda x: x and 'news' in x.lower()})
-            
-            for container in news_containers[:20]:  # Limit to 20 articles
-                try:
-                    title_elem = container.find(['h3', 'h4', 'a'])
-                    if not title_elem:
-                        continue
-                    
-                    title = title_elem.get_text(strip=True)
-                    link = title_elem.get('href', '') if title_elem.name == 'a' else ''
-                    
-                    # Try to find summary/description
-                    summary_elem = container.find(['p', 'div'], {'class': lambda x: x and ('summary' in x.lower() or 'desc' in x.lower())})
-                    summary = summary_elem.get_text(strip=True) if summary_elem else ''
-                    
-                    # Try to find date
-                    date_elem = container.find(['time', 'span'], {'class': lambda x: x and 'date' in x.lower()})
-                    date_str = date_elem.get_text(strip=True) if date_elem else ''
-                    
-                    if title:
-                        news_item = {
-                            'title': title,
-                            'summary': summary,
-                            'link': f"https://finance.yahoo.com{link}" if link.startswith('/') else link,
-                            'date': self._parse_date(date_str),
-                            'symbol': symbol,
-                            'source': 'yahoo_finance'
-                        }
-                        news_items.append(news_item)
-                        
-                except Exception as e:
-                    logger.debug(f"Error parsing news item: {str(e)}")
-                    continue
-            
-            time.sleep(1)  # Rate limiting
-            
-        except Exception as e:
-            logger.error(f"Error scraping Yahoo Finance news for {symbol}: {str(e)}")
-        
-        return news_items
     
     def _parse_date(self, date_str: str) -> datetime:
         """Parse various date formats from news sources."""
@@ -272,42 +253,84 @@ class NewsDataCollector:
                 with open(cache_file, 'rb') as f:
                     cached_data = pickle.load(f)
                 logger.info("Loaded news data from cache")
+                # Convert date strings back to datetime objects
+                for symbol, news_list in cached_data.items():
+                    for item in news_list:
+                        if 'date' in item and isinstance(item['date'], str):
+                            item['date'] = datetime.fromisoformat(item['date'])
                 return cached_data
             except Exception as e:
                 logger.warning(f"Error loading news cache: {str(e)}")
         
         all_news = {}
         
-        # Collect general market news
-        logger.info("Collecting general market news")
-        general_news = self.collect_rss_news()
-        all_news['general'] = general_news
+        # Expanded general news collection
+        logger.info("Collecting general market news from categories...")
+        general_news = self.collect_rss_news(symbol=None, keyword=None)
         
+        logger.info("Collecting general market news from keywords...")
+        for keyword in self.rss_keywords:
+            logger.debug(f"Fetching keyword: {keyword}")
+            general_news.extend(self.collect_rss_news(symbol=None, keyword=keyword))
+        
+        all_news['general'] = self._deduplicate_news(general_news)
+        
+        # --- Save raw general news ---
+        try:
+            raw_general_dir = os.path.join(self.raw_news_dir, 'general')
+            os.makedirs(raw_general_dir, exist_ok=True)
+            raw_file_path = os.path.join(raw_general_dir, 'rss_general_combined.json')
+            with open(raw_file_path, 'w', encoding='utf-8') as f:
+                json.dump(all_news['general'], f, indent=2, default=str, ensure_ascii=False)
+            logger.debug(f"Saved raw general news to {raw_file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save raw general news: {e}")
+        # ----------------------------------
+
         # Collect symbol-specific news
         for symbol in self.symbols:
             logger.info(f"Collecting news for {symbol}")
             
             # RSS news for symbol
-            rss_news = self.collect_rss_news(symbol)
+            rss_news = self.collect_rss_news(symbol=symbol)
             
-            # Yahoo Finance news for symbol
-            yahoo_news = self.collect_yahoo_finance_news(symbol)
+            # --- Save raw symbol news ---
+            try:
+                raw_symbol_dir = os.path.join(self.raw_news_dir, symbol)
+                os.makedirs(raw_symbol_dir, exist_ok=True)
+                
+                rss_file_path = os.path.join(raw_symbol_dir, 'rss_news.json')
+                with open(rss_file_path, 'w', encoding='utf-8') as f:
+                    json.dump(rss_news, f, indent=2, default=str, ensure_ascii=False)
+                
+                logger.debug(f"Saved raw news for {symbol} to {raw_symbol_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to save raw news for {symbol}: {e}")
+            # -----------------------------------
             
-            # Combine and deduplicate
-            symbol_news = rss_news + yahoo_news
-            symbol_news = self._deduplicate_news(symbol_news)
-            
+            symbol_news = self._deduplicate_news(rss_news)
             all_news[symbol] = symbol_news
             time.sleep(1)  # Rate limiting between symbols
         
-        # Cache the data
+        # Cache the combined data
         try:
             with open(cache_file, 'wb') as f:
                 pickle.dump(all_news, f)
-            logger.info("Cached news data")
+            logger.info(f"Cached combined news data to {cache_file}")
         except Exception as e:
-            logger.warning(f"Error caching news data: {str(e)}")
+            logger.warning(f"Error caching combined news data: {str(e)}")
         
+        # Convert date strings to datetime objects for in-memory use
+        for symbol, news_list in all_news.items():
+            for item in news_list:
+                if 'date' in item and isinstance(item['date'], str):
+                    try:
+                        item['date'] = datetime.fromisoformat(item['date'])
+                    except ValueError:
+                        logger.warning(f"Could not parse date {item['date']}, using now()")
+                        item['date'] = datetime.now()
+
+
         return all_news
     
     def _deduplicate_news(self, news_list: List[Dict]) -> List[Dict]:
@@ -330,7 +353,10 @@ class MarketContextCollector:
     def __init__(self, config: Dict):
         self.config = config
         self.cache_dir = config['data']['cache_path']
+        self.raw_data_path = config['data']['raw_data_path']
+        self.raw_market_dir = os.path.join(self.raw_data_path, 'market_context')
         os.makedirs(self.cache_dir, exist_ok=True)
+        os.makedirs(self.raw_market_dir, exist_ok=True)
     
     def collect_economic_indicators(self) -> pd.DataFrame:
         """Collect economic indicators (simplified version using yfinance)."""
@@ -348,6 +374,11 @@ class MarketContextCollector:
                 data = ticker.history(period=f"{self.config['data']['history_days']}d")
                 
                 if not data.empty:
+                    # --- Save raw market data ---
+                    raw_file_path = os.path.join(self.raw_market_dir, f"{name}.csv")
+                    data.to_csv(raw_file_path)
+                    # ---------------------------------
+
                     indicator_data = pd.DataFrame({
                         f'{name}_close': data['Close'],
                         f'{name}_volume': data['Volume']
@@ -375,6 +406,11 @@ class MarketContextCollector:
                 data = ticker.history(period=f"{self.config['data']['history_days']}d")
                 
                 if not data.empty:
+                    # --- Save raw market data ---
+                    raw_file_path = os.path.join(self.raw_market_dir, f"{etf}_sector.csv")
+                    data.to_csv(raw_file_path)
+                    # ---------------------------------
+                    
                     etf_data = pd.DataFrame({
                         f'{etf}_close': data['Close'],
                         f'{etf}_volume': data['Volume'],
@@ -407,12 +443,12 @@ def main():
     
     # Test stock data collection
     stock_collector = StockDataCollector(config)
-    stock_data = stock_collector.collect_all_symbols()
+    stock_data = stock_collector.collect_all_symbols(use_cache=False) # Disable cache for testing
     print(f"Collected stock data for {len(stock_data)} symbols")
     
     # Test news collection
     news_collector = NewsDataCollector(config)
-    news_data = news_collector.collect_all_news()
+    news_data = news_collector.collect_all_news(use_cache=False) # Disable cache for testing
     print(f"Collected news data for {len(news_data)} categories/symbols")
     
     # Test market context collection

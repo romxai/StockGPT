@@ -75,3 +75,6 @@ MANIFEST
 *.temp
 temp/
 tmp/
+
+*.csv
+*.json
