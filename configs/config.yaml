@@ -1,0 +1,293 @@
+# Integrated Stock Prediction System Configuration
+
+# Data Collection Settings
+data:
+  # Primary stock symbols to analyze
+  symbols:
+    - "AAPL"  # Apple Inc.
+    - "MSFT"  # Microsoft Corporation
+    - "GOOGL" # Alphabet Inc.
+    - "AMZN"  # Amazon.com Inc.
+    - "TSLA"  # Tesla Inc.
+    - "NVDA"  # NVIDIA Corporation
+    - "META"  # Meta Platforms Inc.
+    - "NFLX"  # Netflix Inc.
+    - "CRM"   # Salesforce Inc.
+    - "ORCL"  # Oracle Corporation
+    - "JPM"   # JPMorgan Chase & Co.
+    - "BAC"   # Bank of America Corporation
+    - "WFC"   # Wells Fargo & Company
+    - "GS"    # Goldman Sachs Group Inc.
+    - "MS"    # Morgan Stanley
+  
+  # Market context indices
+  market_indices:
+    - "^GSPC"  # S&P 500
+    - "^IXIC"  # NASDAQ Composite
+    - "^VIX"   # CBOE Volatility Index
+    - "^TNX"   # 10-Year Treasury Note Yield
+    - "DX-Y.NYB" # US Dollar Index
+  
+  # Sector ETFs for context
+  sector_etfs:
+    - "XLK"    # Technology Select Sector SPDR Fund
+    - "XLF"    # Financial Select Sector SPDR Fund
+    - "XLE"    # Energy Select Sector SPDR Fund
+    - "XLV"    # Health Care Select Sector SPDR Fund
+    - "XLI"    # Industrial Select Sector SPDR Fund
+  
+  # Data collection parameters
+  history_days: 1000  # Target extensive history
+  news_sources:
+    yahoo_rss: true
+    yahoo_finance: true
+  
+  # Data paths
+  raw_data_path: "data/raw"
+  processed_data_path: "data/processed"
+  cache_path: "data/cache"
+
+# NLP Processing Settings
+nlp:
+  # FinBERT model configuration
+  finbert:
+    model_name: "ProsusAI/finbert"
+    max_length: 512
+    batch_size: 16
+    device: "cuda"  # Use "cpu" if CUDA not available
+  
+  # Text preprocessing
+  preprocessing:
+    clean_html: true
+    remove_urls: true
+    normalize_whitespace: true
+    min_text_length: 10
+  
+  # Named Entity Recognition
+  ner:
+    model: "en_core_web_sm"  # spaCy model
+    extract_entities: ["ORG", "PERSON", "MONEY", "PERCENT"]
+  
+  # Event classification patterns
+  event_patterns:
+    earnings: ["earnings", "quarterly", "revenue", "profit", "loss"]
+    merger: ["merger", "acquisition", "buyout", "takeover"]
+    regulatory: ["regulation", "sec", "fda", "approval", "investigation"]
+    product: ["product", "launch", "release", "innovation", "patent"]
+
+# Feature Engineering Settings
+features:
+  # Technical indicators
+  technical:
+    sma_periods: [5, 10, 20, 50, 200]
+    ema_periods: [12, 26, 50]
+    rsi_period: 14
+    macd_params: [12, 26, 9]
+    bollinger_period: 20
+    bollinger_std: 2
+    stochastic_k: 14
+    stochastic_d: 3
+    williams_r: 14
+    cci_period: 20
+    adx_period: 14
+  
+  # Volume indicators
+  volume:
+    obv: true
+    vwap: true
+    volume_sma: [10, 20]
+    price_volume: true
+  
+  # Volatility measures
+  volatility:
+    atr_period: 14
+    volatility_periods: [5, 10, 20, 30]
+    garch: false  # Set to true if ARCH package available
+  
+  # Market correlation features
+  correlation:
+    market_corr_period: 30
+    sector_corr_period: 30
+    peer_corr_period: 30
+  
+  # Learnable temporal parameters
+  temporal:
+    max_decay_days: 30
+    initial_decay_rate: 0.1
+    event_weight_categories: 5
+    learn_temporal_weights: true
+
+# Model Architecture Settings
+model:
+  # Sequence parameters
+  sequence_length: 60
+  prediction_horizon: 1  # Days ahead to predict
+  
+  # Network architecture
+  embedding_dim: 768  # FinBERT embedding dimension
+  hidden_dim: 256
+  num_layers: 2
+  dropout: 0.3
+  
+  # BiLSTM settings
+  lstm:
+    bidirectional: true
+    batch_first: true
+  
+  # Attention settings
+  attention:
+    num_heads: 8
+    attention_dropout: 0.1
+    use_self_attention: true
+    use_cross_attention: true
+  
+  # Fusion settings
+  fusion:
+    fusion_dim: 512
+    fusion_dropout: 0.2
+  
+  # Output settings
+  output:
+    num_classes: 3  # Up/Down/Neutral
+    activation: "softmax"
+
+# Training Settings
+training:
+  # Optimization
+  optimizer: "adamw"
+  learning_rate: 0.001
+  weight_decay: 0.01
+  
+  # Scheduling
+  scheduler: "cosine"
+  warmup_steps: 1000
+  max_steps: 50000
+  
+  # Training parameters
+  batch_size: 32
+  epochs: 100
+  early_stopping_patience: 10
+  gradient_clip_norm: 1.0
+  
+  # Validation
+  val_split: 0.2
+  shuffle: true
+  
+  # Device settings
+  device: "cuda"  # Use "cpu" if CUDA not available
+  mixed_precision: true
+
+# Hyperparameter Optimization Settings
+optimization:
+  # Optuna settings
+  n_trials: 100
+  timeout: 86400  # 24 hours in seconds
+  study_name: "stock_prediction_study"
+  
+  # Search spaces
+  search_spaces:
+    learning_rate: [0.0001, 0.01]
+    batch_size: [16, 64]
+    hidden_dim: [128, 512]
+    num_layers: [1, 4]
+    dropout: [0.1, 0.5]
+    attention_heads: [4, 16]
+    sequence_length: [30, 120]
+
+# Evaluation Settings
+evaluation:
+  # Walk-Forward Cross-Validation
+  walk_forward:
+    initial_train_size: 252  # ~1 year of trading days
+    step_size: 21  # ~1 month
+    expanding_window: true
+  
+  # Metrics
+  metrics:
+    primary: "accuracy"
+    secondary: ["f1_score", "precision", "recall", "roc_auc", "mcc"]
+  
+  # Trading metrics
+  trading:
+    transaction_cost: 0.001  # 0.1%
+    slippage: 0.0005  # 0.05%
+    initial_capital: 100000
+    position_size: 0.1  # 10% of capital per position
+  
+  # Statistical tests
+  significance:
+    alpha: 0.05
+    bootstrap_samples: 1000
+    paired_tests: true
+  
+  # Multi-sector evaluation
+  sectors:
+    technology: ["AAPL", "MSFT", "GOOGL", "NVDA", "META"]
+    finance: ["JPM", "BAC", "WFC", "GS", "MS"]
+    consumer: ["AMZN", "TSLA", "NFLX"]
+  
+  # Ablation studies
+  ablation:
+    components:
+      - "finbert_embeddings"
+      - "temporal_weights"
+      - "attention_mechanism"
+      - "market_context"
+      - "technical_indicators"
+
+# Explainability Settings
+explainability:
+  # Attention visualization
+  attention_vis:
+    save_heatmaps: true
+    top_k_attention: 10
+  
+  # Feature importance
+  feature_importance:
+    method: "integrated_gradients"
+    baseline: "zero"
+    steps: 50
+  
+  # Temporal analysis
+  temporal_analysis:
+    event_contribution: true
+    decay_visualization: true
+    counterfactual_analysis: true
+
+# Reporting Settings
+reporting:
+  # Output formats
+  formats:
+    csv: true
+    json: true
+    latex: true
+    plots: true
+  
+  # Figure settings
+  figures:
+    dpi: 300
+    format: "png"
+    style: "seaborn"
+  
+  # LaTeX settings
+  latex:
+    format: "ieee"
+    caption_style: "short"
+  
+  # Paths
+  output_path: "results/reports"
+  paper_path: "results/reports/paper"
+
+# Logging Settings
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/stock_predictor.log"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5
+
+# Environment Settings
+environment:
+  seed: 42
+  deterministic: true
+  benchmark: true
