@@ -1,0 +1,39 @@
+# Python 3.12 Compatible Requirements
+# Minimal and stable package versions
+
+# Core libraries
+torch
+torchvision  
+torchaudio
+transformers
+tokenizers
+
+# Data processing
+pandas
+numpy
+scikit-learn
+
+# Financial data
+yfinance
+
+# NLP
+nltk
+
+# Web scraping
+requests
+beautifulsoup4
+feedparser
+
+# ML utilities
+optuna
+
+# Visualization  
+matplotlib
+seaborn
+
+# Configuration
+pyyaml
+tqdm
+
+# Financial metrics
+empyrical
