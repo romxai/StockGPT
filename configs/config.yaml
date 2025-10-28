@@ -2,23 +2,12 @@
 
 # Data Collection Settings
 data:
-  # Primary stock symbols to analyze
+  # Primary stock symbols to analyze (focused on high-profile tech stocks)
   symbols:
     - "AAPL" # Apple Inc.
-    - "MSFT" # Microsoft Corporation
-    - "GOOGL" # Alphabet Inc.
     - "AMZN" # Amazon.com Inc.
     - "TSLA" # Tesla Inc.
     - "NVDA" # NVIDIA Corporation
-    - "META" # Meta Platforms Inc.
-    - "NFLX" # Netflix Inc.
-    - "CRM" # Salesforce Inc.
-    - "ORCL" # Oracle Corporation
-    - "JPM" # JPMorgan Chase & Co.
-    - "BAC" # Bank of America Corporation
-    - "WFC" # Wells Fargo & Company
-    - "GS" # Goldman Sachs Group Inc.
-    - "MS" # Morgan Stanley
 
   # Market context indices
   market_indices:

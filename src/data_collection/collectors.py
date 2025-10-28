@@ -15,6 +15,9 @@ from typing import List, Dict, Optional, Tuple
 import os
 import pickle
 import json # Added for saving raw news
+import re
+import collections
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +48,9 @@ class StockDataCollector:
             elif start and end:
                 data = ticker.history(start=start, end=end)
             else:
-                # Default to history_days
+                # Default to February 2023 till now for consistency with news data
                 end_date = datetime.now()
-                start_date = end_date - timedelta(days=self.history_days)
+                start_date = datetime(2023, 2, 1)  # Same as news data
                 data = ticker.history(start=start_date, end=end_date)
             
             if data.empty:
@@ -170,57 +173,258 @@ class NewsDataCollector:
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
-    
-    def collect_rss_news(self, symbol: str = None, keyword: str = None) -> List[Dict]:
-        """Collect news from Yahoo Finance RSS feeds by symbol, category, or keyword."""
-        all_news = []
         
-        urls_to_fetch = {}
+        # Session for HTTP requests
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+    
+    def _generate_comprehensive_keywords(self, symbol: str) -> List[str]:
+        """
+        Generate focused keywords for news search based on the symbol.
+        Optimized for relevance and speed - reduced keyword count for faster collection.
+        """
+        # Core keywords - most important and relevant first
+        keywords = [
+            symbol,  # Raw ticker symbol
+            f"{symbol} stock",
+            f"{symbol} earnings",
+            f"{symbol} quarterly"
+        ]
+        
+        # Focused symbol-specific keywords - only the most relevant ones
+        symbol_specific = {
+            'AAPL': [
+                'Apple', 'iPhone', 'Tim Cook', 'Apple earnings',
+                'Apple stock', 'iPad', 'Mac', 'Apple services',
+                'Apple event', 'iOS'
+            ],
+            'AMZN': [
+                'Amazon', 'AWS', 'Amazon Prime', 'Jeff Bezos',
+                'Andy Jassy', 'Amazon earnings', 'Amazon stock',
+                'cloud computing', 'e-commerce', 'Prime Day'
+            ],
+            'TSLA': [
+                'Tesla', 'Elon Musk', 'Tesla earnings', 'Tesla stock',
+                'Model 3', 'Model Y', 'Tesla deliveries', 'electric vehicle',
+                'Cybertruck', 'Gigafactory'
+            ],
+            'NVDA': [
+                'NVIDIA', 'Jensen Huang', 'NVIDIA earnings', 'NVIDIA stock',
+                'GPU', 'AI chips', 'data center', 'GeForce',
+                'artificial intelligence', 'semiconductor'
+            ]
+        }
+        
+        # Add focused symbol-specific keywords
+        if symbol in symbol_specific:
+            keywords.extend(symbol_specific[symbol])
+        
+        # Essential financial terms only
+        essential_terms = [
+            f"{symbol} earnings report",
+            f"{symbol} revenue",
+            f"{symbol} analyst",
+            f"{symbol} price target"
+        ]
+        keywords.extend(essential_terms)
+        
+        # Remove duplicates while preserving order
+        unique_keywords = []
+        seen = set()
+        for keyword in keywords:
+            if keyword.lower() not in seen:
+                unique_keywords.append(keyword)
+                seen.add(keyword.lower())
+        
+        return unique_keywords
+    
+    def collect_historical_google_news(self,
+                                      symbol: str,
+                                      start_date: str,
+                                      end_date: str,
+                                      target_articles: Optional[int] = None,
+                                      max_per_day: int = 3) -> List[Dict]:
+        """
+        Collect historical news from Google News archives using multiple search strategies.
+        Uses both combined queries and individual keyword searches for comprehensive coverage.
 
-        if symbol:
-            # Construct symbol-specific URL
-            urls_to_fetch[f'symbol_{symbol}'] = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}"
-        elif keyword:
-            # Construct keyword-specific URL (searches news)
-            urls_to_fetch[f'keyword_{keyword}'] = f"https://feeds.finance.yahoo.com/rss/v1/finance/News?query={keyword}"
-        else:
-            # Use predefined categories
-            urls_to_fetch = self.rss_urls
+        Args:
+            symbol: Stock symbol (e.g., "AAPL")
+            start_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+            target_articles: Desired number of articles (None for no limit)
+            max_per_day: Maximum articles to keep from a single day
 
+        Returns:
+            List of article dictionaries
+        """
+        articles = []
+        day_counter = collections.defaultdict(int)
+
+        # Get comprehensive keywords
+        keywords = self._generate_comprehensive_keywords(symbol)
+        
+        # Convert dates
         try:
-            for category, url in urls_to_fetch.items():
-                logger.debug(f"Fetching RSS feed from: {url}")
-                feed = feedparser.parse(url)
-                
-                for entry in feed.entries:
-                    news_item = {
-                        'title': entry.get('title', ''),
-                        'summary': entry.get('summary', ''),
-                        'link': entry.get('link', ''),
-                        'published': entry.get('published', ''),
-                        'category': category,
-                        'symbol': symbol if symbol else 'general',
-                        'source': 'yahoo_rss'
-                    }
-                    
-                    # Parse published date
-                    try:
-                        if 'published_parsed' in entry:
-                            news_item['date'] = datetime(*entry.published_parsed[:6]).isoformat()
-                        else:
-                            news_item['date'] = datetime.now().isoformat()
-                    except:
-                        news_item['date'] = datetime.now().isoformat()
-                    
-                    all_news.append(news_item)
-                
-                time.sleep(0.5)  # Rate limiting
-                
-        except Exception as e:
-            logger.error(f"Error collecting RSS news: {str(e)}")
+            start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+            end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+        except ValueError:
+            logger.error("Invalid date format. Please use YYYY-MM-DD.")
+            return []
+
+        # Use monthly chunks - go forward from start_dt to end_dt (chronological order)
+        total_months = (end_dt.year - start_dt.year) * 12 + (end_dt.month - start_dt.month) + 1
+        current_start_date = start_dt
+
+        # Progress bar for months
+        month_progress = tqdm(total=total_months, desc=f"Collecting {symbol} news ({start_date} to {end_date})", unit="month", leave=False)
         
-        return all_news
+        # Search strategies to try in order
+        search_strategies = []
+        
+        # Strategy 1: Top priority keywords (company name, ticker, earnings)
+        priority_keywords = [k for k in keywords if any(term in k.lower() 
+                           for term in [symbol.lower(), 'earnings', keywords[1].lower()])][:5]
+        if priority_keywords:
+            search_strategies.append(("Priority", " OR ".join([f'"{k}"' for k in priority_keywords])))
+        
+        # Strategy 2: Combined all keywords (fallback)
+        search_strategies.append(("Combined", " OR ".join([f'"{k}"' for k in keywords[:10]])))
+        
+        # Strategy 3: Individual high-value keywords (if we still need more articles)
+        top_individual = keywords[:3]  # Top 3 most relevant keywords
+        for keyword in top_individual:
+            search_strategies.append(("Individual", f'"{keyword}"'))
+
+        while current_start_date < end_dt and (target_articles is None or len(articles) < target_articles):
+            # Calculate month chunk - go forward chronologically
+            # Get the last day of the current month
+            if current_start_date.month == 12:
+                next_month = current_start_date.replace(year=current_start_date.year + 1, month=1, day=1)
+            else:
+                next_month = current_start_date.replace(month=current_start_date.month + 1, day=1)
+            
+            chunk_end_dt = min(next_month - timedelta(days=1), end_dt)
+            chunk_start_str = current_start_date.strftime('%Y-%m-%d')
+            chunk_end_str = chunk_end_dt.strftime('%Y-%m-%d')
+            
+            month_progress.set_postfix({"Articles": len(articles), "Month": chunk_start_str[:7]})
+
+            # Try each search strategy for this month chunk
+            for strategy_name, search_query in search_strategies:
+                if target_articles is not None and len(articles) >= target_articles:
+                    break
+                    
+                try:
+                    # Google News RSS Search URL
+                    search_url = "https://news.google.com/rss/search"
+                    params = {
+                        'q': f'{search_query} after:{chunk_start_str} before:{chunk_end_str}',
+                        'hl': 'en-US',
+                        'gl': 'US',
+                        'ceid': 'US:en'
+                    }
+
+                    response = self.session.get(search_url, params=params, timeout=20)
+                    response.raise_for_status()
+
+                    if response.status_code == 200:
+                        feed = feedparser.parse(response.content)
+                        week_articles_added = 0
+
+                        for entry in feed.entries:
+                            if target_articles is not None and len(articles) >= target_articles:
+                                break
+                                
+                            pub_date = None
+                            try:
+                                if hasattr(entry, 'published_parsed') and entry.published_parsed:
+                                    pub_date = datetime.fromtimestamp(time.mktime(entry.published_parsed))
+                                elif 'published' in entry:
+                                    try: 
+                                        pub_date = datetime.strptime(entry.published, "%a, %d %b %Y %H:%M:%S %Z")
+                                    except ValueError: 
+                                        try:
+                                            pub_date = datetime.strptime(entry.published, "%a, %d %b %Y %H:%M:%S GMT")
+                                        except ValueError:
+                                            pass
+                            except Exception:
+                                continue
+
+                            # Filter by date range and daily limit
+                            if pub_date and start_dt <= pub_date <= end_dt:
+                                date_key = pub_date.date()
+                                if day_counter[date_key] < max_per_day:
+                                    title = entry.get('title', '').strip()
+                                    link = entry.get('link', '')
+                                    
+                                    # Skip if title is empty or too short
+                                    if len(title) < 10:
+                                        continue
+                                        
+                                    # Check for duplicate titles (case-insensitive)
+                                    is_duplicate = any(
+                                        title.lower() == existing['title'].lower() 
+                                        for existing in articles
+                                    )
+                                    
+                                    if not is_duplicate:
+                                        news_item = {
+                                            'title': title,
+                                            'summary': "",
+                                            'link': link,
+                                            'published': pub_date.isoformat(),
+                                            'date': pub_date.isoformat(),
+                                            'category': 'google_news_historical',
+                                            'symbol': symbol,
+                                            'source': 'google_news_historical'
+                                        }
+                                        
+                                        articles.append(news_item)
+                                        day_counter[date_key] += 1
+                                        week_articles_added += 1
+
+                        # If this strategy found articles, add small delay
+                        if week_articles_added > 0:
+                            time.sleep(0.5)
+
+                except requests.exceptions.RequestException:
+                    time.sleep(2)
+                except Exception:
+                    continue
+                
+                # Small delay between strategies
+                time.sleep(0.3)
+
+            # Move to next month
+            if current_start_date.month == 12:
+                current_start_date = current_start_date.replace(year=current_start_date.year + 1, month=1, day=1)
+            else:
+                current_start_date = current_start_date.replace(month=current_start_date.month + 1, day=1)
+            month_progress.update(1)
+            
+            # Rate limiting between months
+            time.sleep(1.2)
+
+        month_progress.close()
+
+        # Final deduplication and sorting
+        if articles:
+            df = pd.DataFrame(articles)
+            # More thorough deduplication
+            df['title_clean'] = df['title'].str.lower().str.strip()
+            df = df.drop_duplicates(subset=['title_clean'], keep='first')
+            df = df.drop(columns=['title_clean'])
+            
+            df['published_dt'] = pd.to_datetime(df['published'])
+            df = df.sort_values('published_dt', ascending=False).reset_index(drop=True)
+
+            # Convert back to list of dicts
+            return df.to_dict('records')
+        else:
+            return []
     
+
     def _parse_date(self, date_str: str) -> datetime:
         """Parse various date formats from news sources."""
         if not date_str:
@@ -245,91 +449,92 @@ class NewsDataCollector:
         return datetime.now()
     
     def collect_all_news(self, use_cache: bool = True) -> Dict[str, List[Dict]]:
-        """Collect news for all symbols."""
+        """Collect historical news for all symbols using Google News scraping."""
         cache_file = os.path.join(self.cache_dir, 'news_data.pkl')
-        
+
         if use_cache and os.path.exists(cache_file):
             try:
                 with open(cache_file, 'rb') as f:
                     cached_data = pickle.load(f)
                 logger.info("Loaded news data from cache")
-                # Convert date strings back to datetime objects
+                # Convert date strings back to datetime objects if needed (handle potential load errors)
                 for symbol, news_list in cached_data.items():
                     for item in news_list:
                         if 'date' in item and isinstance(item['date'], str):
-                            item['date'] = datetime.fromisoformat(item['date'])
+                            try:
+                                item['date'] = datetime.fromisoformat(item['date'])
+                            except ValueError:
+                                logger.warning(f"Cache load: Could not parse date {item['date']}, using now()")
+                                item['date'] = datetime.now() # Fallback
                 return cached_data
             except Exception as e:
-                logger.warning(f"Error loading news cache: {str(e)}")
-        
-        all_news = {}
-        
-        # Expanded general news collection
-        logger.info("Collecting general market news from categories...")
-        general_news = self.collect_rss_news(symbol=None, keyword=None)
-        
-        logger.info("Collecting general market news from keywords...")
-        for keyword in self.rss_keywords:
-            logger.debug(f"Fetching keyword: {keyword}")
-            general_news.extend(self.collect_rss_news(symbol=None, keyword=keyword))
-        
-        all_news['general'] = self._deduplicate_news(general_news)
-        
-        # --- Save raw general news ---
-        try:
-            raw_general_dir = os.path.join(self.raw_news_dir, 'general')
-            os.makedirs(raw_general_dir, exist_ok=True)
-            raw_file_path = os.path.join(raw_general_dir, 'rss_general_combined.json')
-            with open(raw_file_path, 'w', encoding='utf-8') as f:
-                json.dump(all_news['general'], f, indent=2, default=str, ensure_ascii=False)
-            logger.debug(f"Saved raw general news to {raw_file_path}")
-        except Exception as e:
-            logger.warning(f"Failed to save raw general news: {e}")
-        # ----------------------------------
+                logger.warning(f"Error loading news cache: {str(e)}. Re-fetching data.")
 
-        # Collect symbol-specific news
-        for symbol in self.symbols:
-            logger.info(f"Collecting news for {symbol}")
-            
-            # RSS news for symbol
-            rss_news = self.collect_rss_news(symbol=symbol)
-            
+        all_news = {}
+        all_news['general'] = [] # We are focusing on symbol-specific historical news
+
+        # Determine date range - from February 2023 till now
+        end_date = datetime.now()
+        start_date_dt = datetime(2023, 2, 1)  # Start from February 2023
+        start_date = start_date_dt.strftime('%Y-%m-%d')
+        end_date_str = end_date.strftime('%Y-%m-%d')
+
+        # Collect symbol-specific historical news
+        for symbol in tqdm(self.symbols, desc="Collecting news for symbols", unit="symbol"):
+            # Use the new historical scraping method
+            # No cap on total articles, but limit to max 3 per day from Feb 2023 till now
+            historical_news = self.collect_historical_google_news(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date_str,
+                target_articles=None,  # No total cap
+                max_per_day=3
+            )
+
             # --- Save raw symbol news ---
             try:
                 raw_symbol_dir = os.path.join(self.raw_news_dir, symbol)
                 os.makedirs(raw_symbol_dir, exist_ok=True)
-                
-                rss_file_path = os.path.join(raw_symbol_dir, 'rss_news.json')
-                with open(rss_file_path, 'w', encoding='utf-8') as f:
-                    json.dump(rss_news, f, indent=2, default=str, ensure_ascii=False)
-                
-                logger.debug(f"Saved raw news for {symbol} to {raw_symbol_dir}")
+                # Save the scraped news
+                scrape_file_path = os.path.join(raw_symbol_dir, 'google_historical_news.json')
+                with open(scrape_file_path, 'w', encoding='utf-8') as f:
+                    # Use default=str to handle datetime objects during JSON dump
+                    json.dump(historical_news, f, indent=2, default=str, ensure_ascii=False)
+                logger.debug(f"Saved raw historical news for {symbol} to {raw_symbol_dir}")
             except Exception as e:
                 logger.warning(f"Failed to save raw news for {symbol}: {e}")
             # -----------------------------------
-            
-            symbol_news = self._deduplicate_news(rss_news)
-            all_news[symbol] = symbol_news
-            time.sleep(1)  # Rate limiting between symbols
-        
+
+            all_news[symbol] = historical_news
+            # Removed the 1-second sleep, as sleeps are inside the scraping function now
+
         # Cache the combined data
         try:
+            # Ensure dates are strings before pickling
+            data_to_cache = {}
+            for symbol, news_list in all_news.items():
+                data_to_cache[symbol] = []
+                for item in news_list:
+                    item_copy = item.copy()
+                    if isinstance(item_copy.get('date'), datetime):
+                         item_copy['date'] = item_copy['date'].isoformat() # Convert to string
+                    data_to_cache[symbol].append(item_copy)
+
             with open(cache_file, 'wb') as f:
-                pickle.dump(all_news, f)
+                pickle.dump(data_to_cache, f) # Use data_to_cache
             logger.info(f"Cached combined news data to {cache_file}")
         except Exception as e:
             logger.warning(f"Error caching combined news data: {str(e)}")
-        
-        # Convert date strings to datetime objects for in-memory use
+
+        # Convert date strings back to datetime objects for in-memory use (after caching)
         for symbol, news_list in all_news.items():
             for item in news_list:
                 if 'date' in item and isinstance(item['date'], str):
                     try:
                         item['date'] = datetime.fromisoformat(item['date'])
                     except ValueError:
-                        logger.warning(f"Could not parse date {item['date']}, using now()")
-                        item['date'] = datetime.now()
-
+                        logger.warning(f"Could not parse date {item['date']} after fetch, using now()")
+                        item['date'] = datetime.now() # Fallback
 
         return all_news
     
@@ -371,7 +576,10 @@ class MarketContextCollector:
         for symbol, name in indicators.items():
             try:
                 ticker = yf.Ticker(symbol)
-                data = ticker.history(period=f"{self.config['data']['history_days']}d")
+                # Use same date range as stock and news data (Feb 2023 - now)
+                start_date = datetime(2023, 2, 1)
+                end_date = datetime.now()
+                data = ticker.history(start=start_date, end=end_date)
                 
                 if not data.empty:
                     # --- Save raw market data ---
@@ -403,7 +611,10 @@ class MarketContextCollector:
         for etf in self.config['data']['sector_etfs']:
             try:
                 ticker = yf.Ticker(etf)
-                data = ticker.history(period=f"{self.config['data']['history_days']}d")
+                # Use same date range as stock and news data (Feb 2023 - now)
+                start_date = datetime(2023, 2, 1)
+                end_date = datetime.now()
+                data = ticker.history(start=start_date, end=end_date)
                 
                 if not data.empty:
                     # --- Save raw market data ---
