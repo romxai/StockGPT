@@ -4,6 +4,7 @@ Training and optimization module with AdamW, scheduling, and Optuna hyperparamet
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F # Added for Focal Loss
 import torch.optim as optim
 import numpy as np
 import pandas as pd
@@ -16,13 +17,45 @@ import optuna
 from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner
 import json
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, classification_report
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, classification_report, roc_auc_score # Added roc_auc
 from torch.utils.data import DataLoader, TensorDataset
 import warnings
 import sys # Added for path manipulation in main
 import traceback # Added for debug logging
 
 warnings.filterwarnings('ignore')
+
+logger = logging.getLogger(__name__)
+
+# --- NEW: Focal Loss Implementation (from diagram) ---
+class FocalLoss(nn.Module):
+    """
+    Implementation of Focal Loss for binary classification.
+    """
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # inputs: (B, 1) - raw logits
+        # targets: (B, 1) - 0.0 or 1.0
+        
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss) # p_t
+        
+        alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
+        
+        F_loss = alpha_t * (1 - pt)**self.gamma * BCE_loss
+
+        if self.reduction == 'mean':
+            return torch.mean(F_loss)
+        elif self.reduction == 'sum':
+            return torch.sum(F_loss)
+        else:
+            return F_loss
+# --- END NEW ---
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +179,8 @@ class StockDataset:
     """Dataset class for stock prediction data."""
     
     def __init__(self, text_embeddings: np.ndarray, numerical_features: np.ndarray,
-                 targets: np.ndarray, temporal_info: Optional[Dict[str, np.ndarray]] = None):
+                 targets: np.ndarray, num_classes: int, # --- MODIFIED: Added num_classes ---
+                 temporal_info: Optional[Dict[str, np.ndarray]] = None):
         
         # --- DEBUG: Check input shapes and types ---
         logger.debug(f"StockDataset init: text_embeddings shape={text_embeddings.shape}, dtype={text_embeddings.dtype}")
@@ -160,8 +194,17 @@ class StockDataset:
         # --- Convert to Tensors with explicit types ---
         self.text_embeddings = torch.as_tensor(text_embeddings, dtype=torch.float32)
         self.numerical_features = torch.as_tensor(numerical_features, dtype=torch.float32)
-        self.targets = torch.as_tensor(targets, dtype=torch.long) # Target labels should be Long
-        # ---------------------------------------------
+        
+        # --- MODIFIED: Handle target type based on num_classes ---
+        if num_classes == 1:
+            # Binary classification (BCE/Focal Loss) expects Float targets, shape (B, 1)
+            self.targets = torch.as_tensor(targets, dtype=torch.float32).unsqueeze(-1)
+            logger.debug(f"StockDataset: Targets set to FLOAT, shape={self.targets.shape}")
+        else:
+            # Multiclass (CrossEntropy) expects Long targets, shape (B)
+            self.targets = torch.as_tensor(targets, dtype=torch.long) 
+            logger.debug(f"StockDataset: Targets set to LONG, shape={self.targets.shape}")
+        # --- END MODIFICATION ---
         
         # Handle data types correctly for temporal info
         self.temporal_info = None
@@ -286,6 +329,10 @@ class ModelTrainer:
         self.epochs = config['training']['epochs']
         self.gradient_clip_norm = config['training']['gradient_clip_norm']
         
+        # --- MODIFIED: Added num_classes ---
+        self.num_classes = config['model']['output']['num_classes']
+        # --- END MODIFICATION ---
+        
         # Initialize optimizer
         try:
             self.optimizer = optim.AdamW(
@@ -324,8 +371,19 @@ class ModelTrainer:
             patience=config['training']['early_stopping_patience']
         )
         
-        # Loss function
-        self.criterion = nn.CrossEntropyLoss()
+        # --- MODIFIED: Loss function based on config ---
+        loss_type = config['training'].get('loss_function', 'cross_entropy')
+        if self.num_classes == 1:
+            if loss_type == 'focal_loss':
+                logger.info(f"{model_name}: Using FocalLoss for binary classification.")
+                self.criterion = FocalLoss()
+            else: # Default to BCE for binary
+                logger.info(f"{model_name}: Using BCEWithLogitsLoss for binary classification.")
+                self.criterion = nn.BCEWithLogitsLoss()
+        else:
+            logger.info(f"{model_name}: Using CrossEntropyLoss for {self.num_classes}-class classification.")
+            self.criterion = nn.CrossEntropyLoss()
+        # --- END MODIFICATION ---
         
         # Mixed precision training
         self.use_mixed_precision = config['training'].get('mixed_precision', False)
@@ -415,9 +473,14 @@ class ModelTrainer:
                 total_loss += loss.item() * batch_size
                 total_samples += batch_size
                 
-                # Calculate accuracy
-                _, predicted = torch.max(logits, 1)
-                total_correct += (predicted == targets).sum().item()
+                # --- MODIFIED: Calculate accuracy (binary vs multiclass) ---
+                if self.num_classes == 1:
+                    predicted = (torch.sigmoid(logits) > 0.5).int()
+                    total_correct += (predicted == targets.int()).sum().item()
+                else:
+                    _, predicted = torch.max(logits, 1)
+                    total_correct += (predicted == targets).sum().item()
+                # --- END MODIFICATION ---
                 
             except Exception as batch_err:
                 logger.error(f"{self.model_name}: Error in training batch {batch_idx}: {batch_err}")
@@ -442,6 +505,7 @@ class ModelTrainer:
         total_loss = 0.0
         all_predictions = []
         all_targets = []
+        all_probabilities = [] # For ROC AUC
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_loader):
@@ -473,10 +537,20 @@ class ModelTrainer:
                     batch_size = targets.size(0)
                     total_loss += loss.item() * batch_size
                     
-                    # Store predictions and targets
-                    _, predicted = torch.max(logits, 1)
-                    all_predictions.extend(predicted.cpu().numpy())
-                    all_targets.extend(targets.cpu().numpy())
+                    # --- MODIFIED: Store predictions (binary vs multiclass) ---
+                    if self.num_classes == 1:
+                        probs = torch.sigmoid(logits)
+                        predicted = (probs > 0.5).int()
+                        all_probabilities.extend(probs.cpu().numpy())
+                        all_predictions.extend(predicted.cpu().numpy())
+                        all_targets.extend(targets.int().cpu().numpy())
+                    else:
+                        probs = torch.softmax(logits, dim=1)
+                        _, predicted = torch.max(logits, 1)
+                        all_probabilities.extend(probs.cpu().numpy())
+                        all_predictions.extend(predicted.cpu().numpy())
+                        all_targets.extend(targets.cpu().numpy())
+                    # --- END MODIFICATION ---
                     
                 except Exception as batch_err:
                     logger.error(f"{self.model_name}: Error in validation batch {batch_idx}: {batch_err}")
@@ -492,20 +566,39 @@ class ModelTrainer:
         if not np.isfinite(avg_loss):
             logger.warning(f"{self.model_name}: Average validation loss is not finite: {avg_loss}")
         
+        # --- MODIFIED: Metrics calculation (binary vs multiclass) ---
         accuracy = accuracy_score(all_targets, all_predictions)
+        
+        if self.num_classes == 1:
+            avg_mode = 'binary'
+            roc_auc_avg = 'roc_auc' # Use default for binary
+        else:
+            avg_mode = 'weighted'
+            roc_auc_avg = 'weighted'
+            
         try:
-            f1 = f1_score(all_targets, all_predictions, average='weighted', zero_division=0)
-            precision = precision_score(all_targets, all_predictions, average='weighted', zero_division=0)
-            recall = recall_score(all_targets, all_predictions, average='weighted', zero_division=0)
+            f1 = f1_score(all_targets, all_predictions, average=avg_mode, zero_division=0)
+            precision = precision_score(all_targets, all_predictions, average=avg_mode, zero_division=0)
+            recall = recall_score(all_targets, all_predictions, average=avg_mode, zero_division=0)
+            
+            # ROC AUC
+            if self.num_classes == 1:
+                roc_auc = roc_auc_score(all_targets, all_probabilities)
+            else:
+                # Ensure all_probabilities is correct shape for multiclass
+                roc_auc = roc_auc_score(all_targets, all_probabilities, multi_class='ovr', average=roc_auc_avg)
+
         except ValueError as metric_err:
             logger.warning(f"{self.model_name}: Error calculating metrics: {metric_err}")
-            f1 = precision = recall = 0.0
-        
+            f1 = precision = recall = roc_auc = 0.0
+        # --- END MODIFICATION ---
+
         metrics = {
             'accuracy': accuracy,
             'f1_score': f1,
             'precision': precision,
-            'recall': recall
+            'recall': recall,
+            'roc_auc': roc_auc # Added ROC AUC
         }
         
         return avg_loss, accuracy, metrics
@@ -1050,12 +1143,21 @@ class StockPredictorTrainer:
         if not all_sequences:
             raise ValueError("No valid sequences created from any symbol. Check data and feature engineering steps.")
         
+        # --- MODIFIED: Get num_classes from config ---
+        num_classes = self.config['model']['output']['num_classes']
+        target_dtype = np.float32 if num_classes == 1 else np.int64
+        # --- END MODIFICATION ---
+        
         # Convert to arrays
         try:
             X_num = np.array(all_sequences, dtype=np.float32) 
             X_text = np.array(all_text_embeddings, dtype=np.float32) 
-            y = np.array(all_targets, dtype=np.int64) # Ensure target type is suitable for LongTensor
-            logger.info(f"Target distribution (0=Down, 1=Neutral, 2=Up): {np.bincount(y) / len(y)}")
+            y = np.array(all_targets, dtype=target_dtype) # Use determined dtype
+            
+            if num_classes > 1:
+                logger.info(f"Target distribution (Multiclass): {np.bincount(y) / len(y)}")
+            else:
+                logger.info(f"Target distribution (Binary): {np.mean(y):.2f} positive class")
         except ValueError as e:
              logger.error(f"Error converting sequence lists to numpy arrays: {e}")
              # --- DEBUG: Log shapes of individual elements if conversion fails ---
@@ -1131,10 +1233,12 @@ class StockPredictorTrainer:
 
         # Create datasets using the SCALED data
         try:
+            # --- MODIFIED: Pass num_classes to StockDataset ---
             train_dataset = StockDataset(
                 X_text[train_indices],
                 X_num_train_scaled,  # <-- Use scaled data
                 y[train_indices],
+                num_classes, # Pass num_classes
                 {k: v[train_indices] for k, v in temporal_dict.items()} if temporal_dict else None
             )
             
@@ -1142,8 +1246,10 @@ class StockPredictorTrainer:
                 X_text[val_indices],
                 X_num_val_scaled,  # <-- Use scaled data
                 y[val_indices],
+                num_classes, # Pass num_classes
                 {k: v[val_indices] for k, v in temporal_dict.items()} if temporal_dict else None
             )
+            # --- END MODIFICATION ---
         except Exception as e:
              logger.error(f"Error creating StockDataset objects: {e}")
              logger.debug(traceback.format_exc())
@@ -1769,6 +1875,36 @@ class StockPredictorTrainer:
             logger.debug(traceback.format_exc())
             raise
 
+    # --- COMPATIBILITY METHODS FOR MAIN.PY ---
+    def train(self, train_dataset: StockDataset, val_dataset: StockDataset) -> Dict[str, Any]:
+        """Compatibility method that calls train_all_models and returns best model results."""
+        results = self.train_all_models(train_dataset, val_dataset)
+        if 'error' in results:
+            return results
+        
+        # Get the best model results for backward compatibility
+        best_name, best_model, best_results = self.get_best_model()
+        if best_name:
+            return {
+                'best_model_name': best_name,
+                'best_model': best_model,
+                'results': best_results,
+                'all_results': results
+            }
+        else:
+            return {'error': 'No successful models trained'}
+    
+    def save_model(self, filepath: str, metadata: Optional[Dict] = None):
+        """Compatibility method that saves the best model."""
+        best_name, best_model, best_results = self.get_best_model()
+        if best_name and best_name in self.results:
+            trainer = self.results[best_name]['trainer']
+            trainer.save_model(filepath, metadata)
+            logger.info(f"Saved best model ({best_name}) to {filepath}")
+        else:
+            logger.error("No trained model available to save")
+    # --- END COMPATIBILITY METHODS ---
+
 
 class OptunaOptimizer:
     """Hyperparameter optimization using Optuna."""
@@ -2008,8 +2144,15 @@ def main():
     n_samples = 200 # Smaller sample for quick test
     seq_len = config['model']['sequence_length'] 
     text_dim = config['model']['embedding_dim'] 
-    num_dim = 83 # Match the number of features generated
+    
+    # --- MODIFIED: Use new config key ---
+    try:
+        num_dim = config['model']['numerical_input_dim'] 
+    except KeyError:
+        logger.error("Config missing 'model.numerical_input_dim'. Using 83 for test.")
+        num_dim = 83 # Match the number of features generated
     n_classes = config['model']['output']['num_classes'] 
+    # --- END MODIFICATION --- 
     
     logger.info("Generating dummy data...")
     num_data = np.random.randn(n_samples, seq_len, num_dim).astype(np.float32)
@@ -2020,7 +2163,13 @@ def main():
     num_data = np.nan_to_num(num_data, nan=0.0, posinf=1.0, neginf=-1.0)
     
     text_data = np.random.randn(n_samples, seq_len, text_dim).astype(np.float32)
-    targets = np.random.randint(0, n_classes, n_samples)
+    
+    # --- MODIFIED: Create targets based on num_classes ---
+    if n_classes == 1:
+        targets = np.random.randint(0, 2, n_samples).astype(np.float32) # Binary
+    else:
+        targets = np.random.randint(0, n_classes, n_samples).astype(np.int64) # Multiclass
+    # --- END MODIFICATION ---
     
     # Simulate temporal data
     days_ago = np.random.randint(0, 30, (n_samples, seq_len)).astype(np.float32)
@@ -2030,14 +2179,19 @@ def main():
     # Create datasets
     logger.info("Creating datasets...")
     split = int(0.8 * n_samples)
+    
+    # --- MODIFIED: Pass num_classes to StockDataset ---
     train_dataset = StockDataset(
         text_data[:split], num_data[:split], targets[:split], 
+        n_classes, # Pass num_classes
         {k:v[:split] for k,v in temporal_data.items()}
         )
     val_dataset = StockDataset(
         text_data[split:], num_data[split:], targets[split:],
+        n_classes, # Pass num_classes
         {k:v[split:] for k,v in temporal_data.items()}
         )
+    # --- END MODIFICATION ---
     logger.info(f"Datasets created: Train={len(train_dataset)}, Val={len(val_dataset)}")
 
     # Configure for quick testing

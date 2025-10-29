@@ -7,7 +7,7 @@ data:
     - "AAPL" # Apple Inc.
     - "MSFT" # Microsoft Corporation
     - "NVDA" # NVIDIA Corporation
-    
+
 
   # Market context indices
   market_indices:
@@ -111,33 +111,50 @@ model:
   sequence_length: 60
   prediction_horizon: 1 # Days ahead to predict
 
-  # Network architecture
-  embedding_dim: 768 # FinBERT embedding dimension
-  hidden_dim: 512
-  num_layers: 2
-  dropout: 0.1
+  # Input dimensions (MUST BE SET)
+  embedding_dim: 768 # FinBERT embedding dimension (unchanged)
+  numerical_input_dim: 79 # !!! IMPORTANT: Update this to match your feature count !!!
+  
+  # Network architecture (general)
+  hidden_dim: 512 # Used by baseline models
+  num_layers: 2   # Used by baseline models
+  dropout: 0.2
 
-  # BiLSTM settings
+  # BiLSTM settings (unused by new hybrid)
   lstm:
     bidirectional: true
     batch_first: true
 
-  # Attention settings
+  # Attention settings (general)
   attention:
     num_heads: 8
     attention_dropout: 0.1
     use_self_attention: false
     use_cross_attention: false
 
-  # Fusion settings
-  fusion:
-    fusion_dim: 512
-    fusion_dropout: 0.1
+  # --- NEW: Text Branch (from diagram) ---
+  text_branch:
+    bilstm_layers: 3
+    bilstm_hidden: 512
+    mha_heads: 16
+    transformer_layers: 4
+    text_output_dim: 512
 
-  # Output settings
+  # --- NEW: Numerical Branch (from diagram) ---
+  numerical_branch:
+    projection_dim: 256
+
+  # --- NEW: Fusion Settings (from diagram) ---
+  fusion:
+    # 512 (text) + 256 (num) = 768
+    fusion_dim: 768 
+    fusion_dropout: 0.1
+    classifier_hidden_dim: 256
+
+  # --- MODIFIED: Output Settings ---
   output:
-    num_classes: 3 # Up/Down/Neutral
-    activation: "softmax"
+    num_classes: 1 # MODIFIED: 3 -> 1 for binary classification
+    activation: "sigmoid" # MODIFIED: "softmax" -> "sigmoid"
 
 # Training Settings
 training:
@@ -145,6 +162,7 @@ training:
   optimizer: "adamw"
   learning_rate: 0.001
   weight_decay: 0.01
+  loss_function: "focal_loss" # NEW: Added this key
 
   # Scheduling
   scheduler: "cosine"

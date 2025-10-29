@@ -353,16 +353,13 @@ class FeatureEngineer:
         # Calculate future returns
         df['future_return'] = df['Close'].shift(-horizon) / df['Close'] - 1
         
-        # Create directional labels
-        threshold = 0.005  # 0.5% threshold for neutral class
-        
-        conditions = [
-            df['future_return'] > threshold,      # Up
-            df['future_return'] < -threshold,     # Down
-        ]
-        choices = [2, 0]  # Up=2, Down=0, Neutral=1 (default)
-        
-        df['target'] = np.select(conditions, choices, default=1)
+        # --- MODIFIED FOR BINARY CLASSIFICATION ---
+        # Create binary labels: 1 if future_return > 0 (price went up), 0 otherwise
+        # We use a small threshold (0.0) for a simple binary up/down
+        # The diagram mentions P(price_up), so 1 for positive return, 0 for negative/neutral.
+        threshold = 0.0 
+        df['target'] = (df['future_return'] > threshold).astype(int)
+        # --- END MODIFICATION ---
         
         # Remove the last `horizon` rows (no target available)
         df = df.iloc[:-horizon]
