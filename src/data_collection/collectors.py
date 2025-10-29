@@ -37,6 +37,12 @@ class StockDataCollector:
         self.raw_stock_dir = os.path.join(self.raw_data_path, 'stocks')
         os.makedirs(self.cache_dir, exist_ok=True)
         os.makedirs(self.raw_stock_dir, exist_ok=True)
+
+    def _get_default_date_range(self) -> Tuple[datetime, datetime]:
+        """Return the default start and end dates based on configured history."""
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=self.history_days)
+        return start_date, end_date
         
     def collect_stock_data(self, symbol: str, period: str = None, start: str = None, end: str = None) -> pd.DataFrame:
         """Collect OHLCV data for a single symbol."""
@@ -48,9 +54,8 @@ class StockDataCollector:
             elif start and end:
                 data = ticker.history(start=start, end=end)
             else:
-                # Default to February 2023 till now for consistency with news data
-                end_date = datetime.now()
-                start_date = datetime(2023, 2, 1)  # Same as news data
+                # Default to configured history window
+                start_date, end_date = self._get_default_date_range()
                 data = ticker.history(start=start_date, end=end_date)
             
             if data.empty:
@@ -149,6 +154,7 @@ class NewsDataCollector:
     def __init__(self, config: Dict):
         self.config = config
         self.symbols = config['data']['symbols']
+        self.history_days = config['data']['history_days']
         
         # Define and create all data paths
         self.cache_dir = config['data']['cache_path']
@@ -473,16 +479,16 @@ class NewsDataCollector:
         all_news = {}
         all_news['general'] = [] # We are focusing on symbol-specific historical news
 
-        # Determine date range - from February 2023 till now
+        # Determine date range from configured history window
         end_date = datetime.now()
-        start_date_dt = datetime(2023, 2, 1)  # Start from February 2023
+        start_date_dt = end_date - timedelta(days=self.history_days)
         start_date = start_date_dt.strftime('%Y-%m-%d')
         end_date_str = end_date.strftime('%Y-%m-%d')
 
         # Collect symbol-specific historical news
         for symbol in tqdm(self.symbols, desc="Collecting news for symbols", unit="symbol"):
             # Use the new historical scraping method
-            # No cap on total articles, but limit to max 3 per day from Feb 2023 till now
+            # No cap on total articles, but limit to max 3 per day across the configured range
             historical_news = self.collect_historical_google_news(
                 symbol=symbol,
                 start_date=start_date,
@@ -560,6 +566,7 @@ class MarketContextCollector:
         self.cache_dir = config['data']['cache_path']
         self.raw_data_path = config['data']['raw_data_path']
         self.raw_market_dir = os.path.join(self.raw_data_path, 'market_context')
+        self.history_days = config['data']['history_days']
         os.makedirs(self.cache_dir, exist_ok=True)
         os.makedirs(self.raw_market_dir, exist_ok=True)
     
@@ -576,9 +583,9 @@ class MarketContextCollector:
         for symbol, name in indicators.items():
             try:
                 ticker = yf.Ticker(symbol)
-                # Use same date range as stock and news data (Feb 2023 - now)
-                start_date = datetime(2023, 2, 1)
+                # Use same date range as stock and news data based on history window
                 end_date = datetime.now()
+                start_date = end_date - timedelta(days=self.history_days)
                 data = ticker.history(start=start_date, end=end_date)
                 
                 if not data.empty:
@@ -611,9 +618,9 @@ class MarketContextCollector:
         for etf in self.config['data']['sector_etfs']:
             try:
                 ticker = yf.Ticker(etf)
-                # Use same date range as stock and news data (Feb 2023 - now)
-                start_date = datetime(2023, 2, 1)
+                # Use same date range as stock and news data based on history window
                 end_date = datetime.now()
+                start_date = end_date - timedelta(days=self.history_days)
                 data = ticker.history(start=start_date, end=end_date)
                 
                 if not data.empty:

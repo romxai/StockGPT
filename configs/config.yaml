@@ -5,9 +5,6 @@ data:
   # Primary stock symbols to analyze (focused on high-profile tech stocks)
   symbols:
     - "AAPL" # Apple Inc.
-    - "AMZN" # Amazon.com Inc.
-    - "TSLA" # Tesla Inc.
-    - "NVDA" # NVIDIA Corporation
 
   # Market context indices
   market_indices:
@@ -26,7 +23,7 @@ data:
     - "XLI" # Industrial Select Sector SPDR Fund
 
   # Data collection parameters
-  history_days: 1000 # Target extensive history
+  history_days: 4000 # Target extensive history
   news_sources:
     yahoo_rss: true
     yahoo_finance: true
@@ -113,9 +110,9 @@ model:
 
   # Network architecture
   embedding_dim: 768 # FinBERT embedding dimension
-  hidden_dim: 256
+  hidden_dim: 512
   num_layers: 2
-  dropout: 0.3
+  dropout: 0.1
 
   # BiLSTM settings
   lstm:
@@ -126,13 +123,13 @@ model:
   attention:
     num_heads: 8
     attention_dropout: 0.1
-    use_self_attention: true
-    use_cross_attention: true
+    use_self_attention: false
+    use_cross_attention: false
 
   # Fusion settings
   fusion:
     fusion_dim: 512
-    fusion_dropout: 0.2
+    fusion_dropout: 0.1
 
   # Output settings
   output:
@@ -143,19 +140,19 @@ model:
 training:
   # Optimization
   optimizer: "adamw"
-  learning_rate: 0.0001
+  learning_rate: 0.001
   weight_decay: 0.01
 
   # Scheduling
   scheduler: "cosine"
-  warmup_steps: 1000
-  max_steps: 50000
+  warmup_steps: 100
+  max_steps: 4200
 
   # Training parameters
   batch_size: 32
   epochs: 100
   early_stopping_patience: 10
-  gradient_clip_norm: 0.5
+  gradient_clip_norm: 1.0
 
   # Validation
   val_split: 0.2
@@ -163,7 +160,7 @@ training:
 
   # Device settings
   device: "cuda" # Use "cpu" if CUDA not available
-  mixed_precision: true
+  mixed_precision: false
 
 # Hyperparameter Optimization Settings
 optimization:

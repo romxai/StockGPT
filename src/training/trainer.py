@@ -297,27 +297,46 @@ class StockPredictorTrainer:
              logger.error(f"Error initializing optimizer: {e}. Check model parameters.")
              raise
         
-        # Calculate max_steps based on estimated total steps
-        # This is an approximation, might need adjustment if data size varies a lot
-        # Use a more reasonable default estimate or calculate later
-        estimated_train_size = self.config.get('training',{}).get('estimated_train_samples', 8000) # Default estimate
+        # --- START REPLACEMENT ---
+        # Calculate max_steps based on estimated total steps FIRST
+        # Use a placeholder estimate, this will be updated later if possible
+        estimated_train_size = self.config.get('training', {}).get('estimated_train_samples', 8000) # Default estimate
         if self.batch_size > 0:
-            steps_per_epoch = estimated_train_size // self.batch_size
+            # Calculate steps per epoch based on estimate
+            # Note: This is just for initial setup, it gets refined in the train() method
+            estimated_steps_per_epoch = (estimated_train_size + self.batch_size - 1) // self.batch_size # Use ceiling division
         else:
-            steps_per_epoch = 1 # Avoid division by zero
-        calculated_max_steps = self.epochs * steps_per_epoch
+            estimated_steps_per_epoch = 1 # Avoid division by zero
+        calculated_max_steps = self.epochs * estimated_steps_per_epoch
         
-        # Initialize scheduler
+        # Get max_steps from config, default to 0 if not present
+        config_max_steps = config['training'].get('max_steps', 0)
+        
+        # Determine the final max_steps to use for scheduler initialization
+        # Prefer config value ONLY if it's positive AND smaller than the calculation based on epochs/estimate.
+        # Otherwise, default to the calculated value.
+        if config_max_steps > 0 and config_max_steps < calculated_max_steps:
+             final_max_steps_to_use = config_max_steps
+             logger.info(f"Using max_steps from config for initial scheduler setup: {final_max_steps_to_use}")
+        else:
+             final_max_steps_to_use = calculated_max_steps
+             # Make sure it's at least 1
+             final_max_steps_to_use = max(1, final_max_steps_to_use)
+             logger.info(f"Using calculated max_steps for initial scheduler setup: {final_max_steps_to_use} (Config value was {config_max_steps})")
+        # --- END REPLACEMENT ---
+
+        # Initialize scheduler using the determined value
         self.scheduler = LearningRateScheduler(
             self.optimizer,
-            warmup_steps=config['training'].get('warmup_steps', 0), # Use .get for safety
-            # Use calculated_max_steps if max_steps is not provided or is unreasonably small
-            max_steps=max(config['training'].get('max_steps', 0), calculated_max_steps), 
+            warmup_steps=config['training'].get('warmup_steps', 0), 
+            max_steps=final_max_steps_to_use, # Use the determined value
             base_lr=self.learning_rate
         )
-        # --- Store the final max_steps used ---
+        
+        # Store the final max_steps intended (will be updated again in train method)
         self.final_max_steps = self.scheduler.max_steps 
-        # ---------------------------------------
+        
+        logger.info(f"Scheduler initially initialized with warmup={config['training'].get('warmup_steps', 0)}, max_steps={self.final_max_steps}")
         logger.info(f"Scheduler initialized with warmup={config['training'].get('warmup_steps', 0)}, max_steps={self.final_max_steps}")
         
         # Early stopping
@@ -405,6 +424,7 @@ class StockPredictorTrainer:
             X_num = np.array(all_sequences, dtype=np.float32) 
             X_text = np.array(all_text_embeddings, dtype=np.float32) 
             y = np.array(all_targets, dtype=np.int64) # Ensure target type is suitable for LongTensor
+            logger.info(f"Target distribution (0=Down, 1=Neutral, 2=Up): {np.bincount(y) / len(y)}")
         except ValueError as e:
              logger.error(f"Error converting sequence lists to numpy arrays: {e}")
              # --- DEBUG: Log shapes of individual elements if conversion fails ---
@@ -450,18 +470,46 @@ class StockPredictorTrainer:
         
         logger.info(f"Splitting data: Train size={len(train_indices)}, Validation size={len(val_indices)}")
 
-        # Create datasets
+        # Normalize numerical features using StandardScaler
+        from sklearn.preprocessing import StandardScaler
+
+        # 1. Get shapes
+        n_samples_train = X_num[train_indices].shape[0]
+        n_samples_val = X_num[val_indices].shape[0]
+        seq_len = X_num.shape[1]
+        n_features = X_num.shape[2]
+
+        # 2. Reshape data for scaling
+        # Reshape from [samples, seq_len, features] to [samples * seq_len, features]
+        X_num_train_2d = X_num[train_indices].reshape(-1, n_features)
+        X_num_val_2d = X_num[val_indices].reshape(-1, n_features)
+
+        # 3. Fit scaler ONLY on training data
+        scaler = StandardScaler()
+        scaler.fit(X_num_train_2d)
+
+        # 4. Transform both train and validation data
+        X_num_train_scaled_2d = scaler.transform(X_num_train_2d)
+        X_num_val_scaled_2d = scaler.transform(X_num_val_2d)
+
+        # 5. Reshape back to [samples, seq_len, features]
+        X_num_train_scaled = X_num_train_scaled_2d.reshape(n_samples_train, seq_len, n_features)
+        X_num_val_scaled = X_num_val_scaled_2d.reshape(n_samples_val, seq_len, n_features)
+
+        logger.info("Applied StandardScaler to numerical features.")
+
+        # Create datasets using the SCALED data
         try:
             train_dataset = StockDataset(
                 X_text[train_indices],
-                X_num[train_indices],
+                X_num_train_scaled,  # <-- Use scaled data
                 y[train_indices],
                 {k: v[train_indices] for k, v in temporal_dict.items()} if temporal_dict else None
             )
             
             val_dataset = StockDataset(
                 X_text[val_indices],
-                X_num[val_indices],
+                X_num_val_scaled,  # <-- Use scaled data
                 y[val_indices],
                 {k: v[val_indices] for k, v in temporal_dict.items()} if temporal_dict else None
             )
@@ -592,14 +640,21 @@ class StockPredictorTrainer:
                 days_ago_val = (current_sequence_date - lookup_date).days
                 
                 if lookup_date in news_lookup:
-                    news_item = news_lookup[lookup_date][0] # Using first news item
-                    embedding = news_item.get('finbert_embedding')
+                    # Average all embeddings for this day
+                    day_embeddings = []
+                    for news_item in news_lookup[lookup_date]:
+                        embedding = news_item.get('finbert_embedding')
+                        if embedding is not None and isinstance(embedding, np.ndarray) and embedding.shape == (768,):
+                            day_embeddings.append(embedding.astype(np.float32))
                     
-                    if embedding is not None and isinstance(embedding, np.ndarray) and embedding.shape == (768,):
-                        text_seq.append(embedding.astype(np.float32)) 
+                    if day_embeddings:
+                        # Average the embeddings
+                        avg_embedding = np.mean(day_embeddings, axis=0)
+                        text_seq.append(avg_embedding)
                         valid_embedding_found = True
                     else:
-                        text_seq.append(np.zeros(768, dtype=np.float32)) 
+                        # No valid embeddings found for this day's articles
+                        text_seq.append(np.zeros(768, dtype=np.float32))
                     
                     temporal_seq['days_ago'].append(max(0, days_ago_val)) 
                     temporal_seq['event_categories'].append(0) # Placeholder category
