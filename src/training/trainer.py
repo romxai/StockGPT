@@ -269,15 +269,646 @@ def collate_fn(batch):
         raise collate_err # Re-raise error to stop training
 
 
-class StockPredictorTrainer:
-    """Main training class for stock prediction model."""
+class ModelTrainer:
+    """Individual model trainer for consistent training across different model types."""
     
-    def __init__(self, model: nn.Module, config: Dict):
+    def __init__(self, model: nn.Module, model_name: str, config: Dict, device: torch.device):
         self.model = model
+        self.model_name = model_name
+        self.config = config
+        self.device = device
+        self.model.to(self.device)
+        
+        # Training parameters
+        self.learning_rate = config['training']['learning_rate']
+        self.weight_decay = config['training']['weight_decay']
+        self.batch_size = config['training']['batch_size']
+        self.epochs = config['training']['epochs']
+        self.gradient_clip_norm = config['training']['gradient_clip_norm']
+        
+        # Initialize optimizer
+        try:
+            self.optimizer = optim.AdamW(
+                self.model.parameters(),
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay
+            )
+        except ValueError as e:
+            logger.error(f"Error initializing optimizer for {model_name}: {e}")
+            raise
+        
+        # Calculate scheduler parameters
+        estimated_train_size = self.config.get('training', {}).get('estimated_train_samples', 8000)
+        if self.batch_size > 0:
+            estimated_steps_per_epoch = max(1, estimated_train_size // self.batch_size)
+        else:
+            estimated_steps_per_epoch = 100
+        calculated_max_steps = self.epochs * estimated_steps_per_epoch
+        
+        config_max_steps = config['training'].get('max_steps', 0)
+        if config_max_steps > 0 and config_max_steps < calculated_max_steps:
+            final_max_steps_to_use = config_max_steps
+        else:
+            final_max_steps_to_use = calculated_max_steps
+        
+        # Initialize scheduler
+        self.scheduler = LearningRateScheduler(
+            self.optimizer,
+            warmup_steps=config['training'].get('warmup_steps', 0),
+            max_steps=final_max_steps_to_use,
+            base_lr=self.learning_rate
+        )
+        
+        # Early stopping
+        self.early_stopping = EarlyStopping(
+            patience=config['training']['early_stopping_patience']
+        )
+        
+        # Loss function
+        self.criterion = nn.CrossEntropyLoss()
+        
+        # Mixed precision training
+        self.use_mixed_precision = config['training'].get('mixed_precision', False)
+        self.scaler = None
+        if self.use_mixed_precision and self.device.type == 'cuda':
+            self.scaler = torch.cuda.amp.GradScaler()
+        elif self.use_mixed_precision and self.device.type != 'cuda':
+            logger.warning(f"Mixed precision requested for {model_name} but CUDA not available. Disabling mixed precision.")
+        
+        # Training history
+        self.training_history = {
+            'train_loss': [],
+            'train_accuracy': [],
+            'val_loss': [],
+            'val_accuracy': [],
+            'learning_rates': []
+        }
+        
+    def train_epoch(self, train_loader: DataLoader) -> Tuple[float, float]:
+        """Train for one epoch."""
+        self.model.train()
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        nan_loss_batches = 0
+        nan_logit_batches = 0
+        
+        for batch_idx, batch in enumerate(train_loader):
+            try:
+                # Move batch to device
+                text_embeddings = batch['text_embeddings'].to(self.device)
+                numerical_features = batch['numerical_features'].to(self.device)
+                targets = batch['targets'].to(self.device)
+                
+                # Handle temporal info if present
+                temporal_info = None
+                if 'temporal_info' in batch and batch['temporal_info']:
+                    temporal_info = {
+                        'days_ago': batch['temporal_info']['days_ago'].to(self.device),
+                        'event_categories': batch['temporal_info']['event_categories'].to(self.device)
+                    }
+                
+                # Zero gradients
+                self.optimizer.zero_grad()
+                
+                # Forward pass with mixed precision if enabled
+                if self.use_mixed_precision and self.scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        output = self.model(text_embeddings, numerical_features, temporal_info)
+                        logits = output['logits']
+                        loss = self.criterion(logits, targets)
+                else:
+                    output = self.model(text_embeddings, numerical_features, temporal_info)
+                    logits = output['logits']
+                    loss = self.criterion(logits, targets)
+                
+                # Check for NaN/Inf in logits and loss
+                if not torch.isfinite(logits).all():
+                    nan_logit_batches += 1
+                    logger.warning(f"{self.model_name}: NaN/Inf detected in logits at batch {batch_idx}")
+                    continue
+                
+                if not torch.isfinite(loss):
+                    nan_loss_batches += 1
+                    logger.warning(f"{self.model_name}: NaN/Inf detected in loss at batch {batch_idx}")
+                    continue
+                
+                # Backward pass
+                if self.use_mixed_precision and self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                    if self.gradient_clip_norm > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    if self.gradient_clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
+                    self.optimizer.step()
+                
+                # Step scheduler
+                self.scheduler.step()
+                
+                # Update statistics
+                batch_size = targets.size(0)
+                total_loss += loss.item() * batch_size
+                total_samples += batch_size
+                
+                # Calculate accuracy
+                _, predicted = torch.max(logits, 1)
+                total_correct += (predicted == targets).sum().item()
+                
+            except Exception as batch_err:
+                logger.error(f"{self.model_name}: Error in training batch {batch_idx}: {batch_err}")
+                continue
+        
+        if nan_logit_batches > 0:
+            logger.warning(f"{self.model_name}: Had {nan_logit_batches} batches with NaN/Inf logits")
+        if nan_loss_batches > 0:
+            logger.warning(f"{self.model_name}: Had {nan_loss_batches} batches with NaN/Inf loss")
+        
+        avg_loss = total_loss / total_samples if total_samples > 0 else float('nan')
+        accuracy = total_correct / total_samples if total_samples > 0 else 0.0
+        
+        if not np.isfinite(avg_loss):
+            logger.warning(f"{self.model_name}: Average training loss is not finite: {avg_loss}")
+        
+        return avg_loss, accuracy
+    
+    def validate(self, val_loader: DataLoader) -> Tuple[float, float, Dict[str, float]]:
+        """Validate the model."""
+        self.model.eval()
+        total_loss = 0.0
+        all_predictions = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_loader):
+                try:
+                    # Move batch to device
+                    text_embeddings = batch['text_embeddings'].to(self.device)
+                    numerical_features = batch['numerical_features'].to(self.device)
+                    targets = batch['targets'].to(self.device)
+                    
+                    # Handle temporal info if present
+                    temporal_info = None
+                    if 'temporal_info' in batch and batch['temporal_info']:
+                        temporal_info = {
+                            'days_ago': batch['temporal_info']['days_ago'].to(self.device),
+                            'event_categories': batch['temporal_info']['event_categories'].to(self.device)
+                        }
+                    
+                    # Forward pass
+                    output = self.model(text_embeddings, numerical_features, temporal_info)
+                    logits = output['logits']
+                    loss = self.criterion(logits, targets)
+                    
+                    # Skip if NaN/Inf
+                    if not torch.isfinite(loss) or not torch.isfinite(logits).all():
+                        logger.warning(f"{self.model_name}: Skipping validation batch {batch_idx} due to NaN/Inf")
+                        continue
+                    
+                    # Update statistics
+                    batch_size = targets.size(0)
+                    total_loss += loss.item() * batch_size
+                    
+                    # Store predictions and targets
+                    _, predicted = torch.max(logits, 1)
+                    all_predictions.extend(predicted.cpu().numpy())
+                    all_targets.extend(targets.cpu().numpy())
+                    
+                except Exception as batch_err:
+                    logger.error(f"{self.model_name}: Error in validation batch {batch_idx}: {batch_err}")
+                    continue
+        
+        total_samples = len(all_targets)
+        avg_loss = total_loss / total_samples if total_samples > 0 else float('nan')
+        
+        if not all_targets or not all_predictions or total_samples == 0:
+            logger.error(f"{self.model_name}: No valid validation samples")
+            return float('nan'), 0.0, {}
+        
+        if not np.isfinite(avg_loss):
+            logger.warning(f"{self.model_name}: Average validation loss is not finite: {avg_loss}")
+        
+        accuracy = accuracy_score(all_targets, all_predictions)
+        try:
+            f1 = f1_score(all_targets, all_predictions, average='weighted', zero_division=0)
+            precision = precision_score(all_targets, all_predictions, average='weighted', zero_division=0)
+            recall = recall_score(all_targets, all_predictions, average='weighted', zero_division=0)
+        except ValueError as metric_err:
+            logger.warning(f"{self.model_name}: Error calculating metrics: {metric_err}")
+            f1 = precision = recall = 0.0
+        
+        metrics = {
+            'accuracy': accuracy,
+            'f1_score': f1,
+            'precision': precision,
+            'recall': recall
+        }
+        
+        return avg_loss, accuracy, metrics
+    
+    def train(self, train_dataset: StockDataset, val_dataset: StockDataset) -> Dict[str, Any]:
+        """Main training loop for individual model."""
+        if len(train_dataset) == 0 or len(val_dataset) == 0:
+            logger.error(f"{self.model_name}: Empty dataset provided")
+            return {'error': 'Empty dataset'}
+        
+        logger.info(f"Starting training for {self.model_name}...")
+        
+        # Create data loaders
+        try:
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                collate_fn=collate_fn,
+                num_workers=0
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                collate_fn=collate_fn,
+                num_workers=0
+            )
+        except Exception as loader_err:
+            logger.error(f"{self.model_name}: Error creating data loaders: {loader_err}")
+            return {'error': f'Data loader creation failed: {loader_err}'}
+        
+        # Handle Random Forest special case
+        if hasattr(self.model, 'model_type') and self.model.model_type == 'random_forest':
+            return self._train_random_forest(train_dataset, val_dataset)
+        
+        best_val_accuracy = -1.0
+        epochs_run = 0
+        final_val_metrics = {}
+        
+        try:
+            for epoch in range(self.epochs):
+                epochs_run = epoch + 1
+                
+                # Training
+                train_loss, train_acc = self.train_epoch(train_loader)
+                
+                # Validation
+                val_loss, val_acc, val_metrics = self.validate(val_loader)
+                
+                # Update history
+                self.training_history['train_loss'].append(train_loss)
+                self.training_history['train_accuracy'].append(train_acc)
+                self.training_history['val_loss'].append(val_loss)
+                self.training_history['val_accuracy'].append(val_acc)
+                self.training_history['learning_rates'].append(self.scheduler.get_lr())
+                
+                # Track best accuracy
+                if np.isfinite(val_acc) and val_acc > best_val_accuracy:
+                    best_val_accuracy = val_acc
+                    final_val_metrics = val_metrics.copy()
+                
+                # Log progress
+                if epoch % 10 == 0 or epoch == self.epochs - 1:
+                    logger.info(f"{self.model_name} Epoch {epoch+1}/{self.epochs}: "
+                              f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, "
+                              f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+                
+                # Early stopping check
+                if self.early_stopping(val_acc, self.model):
+                    logger.info(f"{self.model_name}: Early stopping triggered at epoch {epoch+1}")
+                    break
+                    
+        except Exception as train_err:
+            logger.error(f"{self.model_name}: Training failed: {train_err}")
+            return {'error': f'Training failed: {train_err}'}
+        
+        final_best_val_acc = self.early_stopping.best_score if self.early_stopping.restored_weights else best_val_accuracy
+        
+        final_results = {
+            'best_val_accuracy': final_best_val_acc,
+            'final_val_metrics': final_val_metrics,
+            'training_history': self.training_history,
+            'total_epochs': epochs_run
+        }
+        
+        logger.info(f"{self.model_name} training completed. Best validation accuracy: {final_best_val_acc:.4f} over {epochs_run} epochs.")
+        
+        return final_results
+    
+    def _train_random_forest(self, train_dataset: StockDataset, val_dataset: StockDataset) -> Dict[str, Any]:
+        """Special training procedure for Random Forest."""
+        try:
+            # Prepare training data
+            X_train = []
+            y_train = []
+            
+            for i in range(len(train_dataset)):
+                item = train_dataset[i]
+                text_emb = item['text_embeddings'].numpy()
+                num_feat = item['numerical_features'].numpy()
+                target = item['targets'].item()
+                
+                # Concatenate and flatten features
+                combined = np.concatenate([text_emb, num_feat], axis=-1)
+                X_train.append(combined.flatten())
+                y_train.append(target)
+            
+            X_train = np.array(X_train)
+            y_train = np.array(y_train)
+            
+            # Fit the model
+            self.model.fit(X_train, y_train)
+            
+            # Validate
+            X_val = []
+            y_val = []
+            
+            for i in range(len(val_dataset)):
+                item = val_dataset[i]
+                text_emb = item['text_embeddings'].numpy()
+                num_feat = item['numerical_features'].numpy()
+                target = item['targets'].item()
+                
+                combined = np.concatenate([text_emb, num_feat], axis=-1)
+                X_val.append(combined.flatten())
+                y_val.append(target)
+            
+            X_val = np.array(X_val)
+            y_val = np.array(y_val)
+            
+            # Get predictions using the model's forward method
+            val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
+            all_predictions = []
+            all_targets = []
+            
+            self.model.eval()
+            with torch.no_grad():
+                for batch in val_loader:
+                    text_embeddings = batch['text_embeddings']
+                    numerical_features = batch['numerical_features']
+                    targets = batch['targets']
+                    
+                    output = self.model(text_embeddings, numerical_features)
+                    logits = output['logits']
+                    
+                    _, predicted = torch.max(logits, 1)
+                    all_predictions.extend(predicted.numpy())
+                    all_targets.extend(targets.numpy())
+            
+            # Calculate metrics
+            accuracy = accuracy_score(all_targets, all_predictions)
+            f1 = f1_score(all_targets, all_predictions, average='weighted', zero_division=0)
+            precision = precision_score(all_targets, all_predictions, average='weighted', zero_division=0)
+            recall = recall_score(all_targets, all_predictions, average='weighted', zero_division=0)
+            
+            metrics = {
+                'accuracy': accuracy,
+                'f1_score': f1,
+                'precision': precision,
+                'recall': recall
+            }
+            
+            return {
+                'best_val_accuracy': accuracy,
+                'final_val_metrics': metrics,
+                'training_history': {'val_accuracy': [accuracy]},
+                'total_epochs': 1
+            }
+            
+        except Exception as e:
+            logger.error(f"{self.model_name}: Random Forest training failed: {e}")
+            return {'error': f'Random Forest training failed: {e}'}
+    
+    def save_model(self, filepath: str, metadata: Optional[Dict] = None):
+        """Save model checkpoint."""
+        # Ensure directory exists just before saving
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        except OSError as e:
+            logger.error(f"{self.model_name}: Error creating directory for {filepath}: {e}")
+            raise
+
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': {'max_steps': self.scheduler.max_steps, 'current_step': self.scheduler.current_step},
+            'training_history': self.training_history,
+            'best_score': self.early_stopping.best_score,
+            'config': { 
+                 'model': self.config.get('model'), 
+                 'features': self.config.get('features'),
+                 'training': self.config.get('training')
+                 },
+            'metadata': metadata or {}
+        }
+        
+        try:
+            torch.save(checkpoint, filepath)
+            logger.info(f"{self.model_name}: Model saved to {filepath}")
+        except Exception as e:
+            logger.error(f"{self.model_name}: Error saving model to {filepath}: {e}")
+            raise
+
+
+class StockPredictorTrainer:
+    """Main training class for stock prediction with multiple models."""
+    
+    def __init__(self, config: Dict):
         self.config = config
         self.device = torch.device(config['training']['device'] if torch.cuda.is_available() else 'cpu')
         logger.info(f"Using device: {self.device}")
-        self.model.to(self.device)
+        
+        # Model configurations
+        self.model_configs = {
+            'hybrid': {'enabled': True, 'priority': 1},
+            'logistic_regression': {'enabled': True, 'priority': 2},
+            'random_forest': {'enabled': True, 'priority': 3},
+            'basic_lstm': {'enabled': True, 'priority': 4},
+            'bilstm': {'enabled': True, 'priority': 5},
+            'bilstm_attention': {'enabled': True, 'priority': 6},
+            'transformer': {'enabled': True, 'priority': 7}
+        }
+        
+        # Override with config if available
+        if 'models' in config:
+            for model_name, model_config in config['models'].items():
+                if model_name in self.model_configs:
+                    self.model_configs[model_name].update(model_config)
+        
+        self.results = {}
+        self.models = {}
+    
+    def create_models(self) -> Dict[str, nn.Module]:
+        """Create all models based on configuration."""
+        models = {}
+        
+        # Import model classes
+        try:
+            from ..models.hybrid_model import HybridStockPredictor
+            from ..models.baseline_models import BaselineModelFactory
+        except ImportError as e:
+            logger.error(f"Failed to import model classes: {e}")
+            raise
+        
+        # Create hybrid model first
+        if self.model_configs['hybrid']['enabled']:
+            try:
+                hybrid_model = HybridStockPredictor(self.config)
+                models['hybrid'] = hybrid_model
+                logger.info("Created hybrid model")
+            except Exception as e:
+                logger.error(f"Failed to create hybrid model: {e}")
+        
+        # Create baseline models
+        baseline_types = ['logistic_regression', 'random_forest', 'basic_lstm', 
+                         'bilstm', 'bilstm_attention', 'transformer']
+        
+        for model_type in baseline_types:
+            if self.model_configs[model_type]['enabled']:
+                try:
+                    baseline_model = BaselineModelFactory.create_model(model_type, self.config)
+                    models[model_type] = baseline_model
+                    logger.info(f"Created {model_type} model")
+                except Exception as e:
+                    logger.error(f"Failed to create {model_type} model: {e}")
+        
+        return models
+    
+    def train_all_models(self, train_dataset: StockDataset, val_dataset: StockDataset) -> Dict[str, Any]:
+        """Train all models and return results."""
+        logger.info("Starting training for all models...")
+        
+        # Create all models
+        self.models = self.create_models()
+        
+        if not self.models:
+            logger.error("No models were successfully created")
+            return {'error': 'No models created'}
+        
+        # Sort models by priority
+        sorted_models = sorted(
+            self.models.items(),
+            key=lambda x: self.model_configs[x[0]]['priority']
+        )
+        
+        # Train each model
+        for model_name, model in sorted_models:
+            logger.info(f"\n{'='*50}")
+            logger.info(f"Training {model_name.upper()} model")
+            logger.info(f"{'='*50}")
+            
+            try:
+                # Create individual trainer
+                trainer = ModelTrainer(model, model_name, self.config, self.device)
+                
+                # Train the model
+                results = trainer.train(train_dataset, val_dataset)
+                
+                # Store results
+                self.results[model_name] = {
+                    'results': results,
+                    'model': model,
+                    'trainer': trainer
+                }
+                
+                # Log results
+                if 'error' not in results:
+                    best_acc = results.get('best_val_accuracy', 0)
+                    logger.info(f"{model_name} completed - Best Val Accuracy: {best_acc:.4f}")
+                else:
+                    logger.error(f"{model_name} failed: {results['error']}")
+                    
+            except Exception as e:
+                logger.error(f"Failed to train {model_name}: {e}")
+                self.results[model_name] = {'error': str(e)}
+        
+        # Generate summary
+        summary = self.generate_summary()
+        logger.info(f"\n{'='*60}")
+        logger.info("TRAINING SUMMARY")
+        logger.info(f"{'='*60}")
+        logger.info(summary)
+        
+        return {
+            'individual_results': self.results,
+            'summary': summary,
+            'models': self.models
+        }
+    
+    def generate_summary(self) -> str:
+        """Generate a summary of all model results."""
+        summary_lines = []
+        
+        # Collect results
+        model_results = []
+        for model_name, result_data in self.results.items():
+            if 'error' in result_data:
+                model_results.append({
+                    'name': model_name,
+                    'accuracy': 0.0,
+                    'status': 'FAILED',
+                    'error': result_data['error']
+                })
+            else:
+                results = result_data['results']
+                model_results.append({
+                    'name': model_name,
+                    'accuracy': results.get('best_val_accuracy', 0.0),
+                    'status': 'SUCCESS',
+                    'epochs': results.get('total_epochs', 0)
+                })
+        
+        # Sort by accuracy (descending)
+        model_results.sort(key=lambda x: x['accuracy'], reverse=True)
+        
+        # Generate summary
+        summary_lines.append(f"{'Model':<20} {'Accuracy':<10} {'Status':<10} {'Info'}")
+        summary_lines.append("-" * 60)
+        
+        for result in model_results:
+            accuracy_str = f"{result['accuracy']:.4f}" if result['accuracy'] > 0 else "N/A"
+            info = f"Epochs: {result.get('epochs', 'N/A')}" if result['status'] == 'SUCCESS' else result.get('error', '')[:30]
+            summary_lines.append(f"{result['name']:<20} {accuracy_str:<10} {result['status']:<10} {info}")
+        
+        return "\n".join(summary_lines)
+    
+    def save_all_models(self, output_dir: str):
+        """Save all trained models."""
+        import os
+        from datetime import datetime
+        
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        for model_name, result_data in self.results.items():
+            if 'error' not in result_data and 'trainer' in result_data:
+                try:
+                    model_path = os.path.join(output_dir, f"{model_name}_{timestamp}.pth")
+                    trainer = result_data['trainer']
+                    trainer.save_model(model_path, {'model_type': model_name})
+                    logger.info(f"Saved {model_name} model to {model_path}")
+                except Exception as e:
+                    logger.error(f"Failed to save {model_name}: {e}")
+    
+    def get_best_model(self) -> Tuple[str, nn.Module, Dict]:
+        """Get the best performing model."""
+        best_name = None
+        best_model = None
+        best_results = None
+        best_accuracy = -1.0
+        
+        for model_name, result_data in self.results.items():
+            if 'error' not in result_data:
+                results = result_data['results']
+                accuracy = results.get('best_val_accuracy', 0.0)
+                if accuracy > best_accuracy:
+                    best_accuracy = accuracy
+                    best_name = model_name
+                    best_model = result_data['model']
+                    best_results = results
+        
+        return best_name, best_model, best_results
         
         # Training parameters
         self.learning_rate = config['training']['learning_rate']
@@ -1354,7 +1985,7 @@ class OptunaOptimizer:
 
 
 def main():
-    """Test the training functionality."""
+    """Test the new multi-model training functionality."""
     import yaml
     
     # Load configuration
@@ -1382,10 +2013,12 @@ def main():
     
     logger.info("Generating dummy data...")
     num_data = np.random.randn(n_samples, seq_len, num_dim).astype(np.float32)
-    # --- Add some NaNs/Infs to test filling ---
+    # Fill NaNs/Infs for testing
     num_data[0, 0, 0] = np.nan
     num_data[1, 1, 1] = np.inf
-    # ----------------------------------------
+    # Replace NaNs/Infs with valid values
+    num_data = np.nan_to_num(num_data, nan=0.0, posinf=1.0, neginf=-1.0)
+    
     text_data = np.random.randn(n_samples, seq_len, text_dim).astype(np.float32)
     targets = np.random.randint(0, n_classes, n_samples)
     
@@ -1406,6 +2039,24 @@ def main():
         {k:v[split:] for k,v in temporal_data.items()}
         )
     logger.info(f"Datasets created: Train={len(train_dataset)}, Val={len(val_dataset)}")
+
+    # Configure for quick testing
+    test_config = config.copy()
+    test_config['training']['epochs'] = 3  # Small number for testing
+    test_config['training']['learning_rate'] = 0.001  # Reasonable learning rate
+    test_config['training']['mixed_precision'] = False  # Disable for testing
+    test_config['training']['early_stopping_patience'] = 2  # Quick early stopping
+    
+    # Optionally disable some models for faster testing
+    test_config['models'] = {
+        'hybrid': {'enabled': True, 'priority': 1},
+        'logistic_regression': {'enabled': True, 'priority': 2},
+        'basic_lstm': {'enabled': True, 'priority': 3},
+        'bilstm': {'enabled': True, 'priority': 4},
+        'random_forest': {'enabled': False, 'priority': 5},  # Disable for speed
+        'bilstm_attention': {'enabled': False, 'priority': 6},  # Disable for speed
+        'transformer': {'enabled': False, 'priority': 7}  # Disable for speed
+    }
 
     
     # Create model
@@ -1437,19 +2088,49 @@ def main():
          return
 
     
-    # Test training
-    logger.info("Starting dummy training test...")
+    # Create multi-model trainer
     try:
-        results = trainer.train(train_dataset, val_dataset)
-        print("-" * 30)
-        print(f"Training completed. Best validation accuracy: {results.get('best_val_accuracy', 'N/A')}")
-        if isinstance(results.get('best_val_accuracy'), float):
-             print(f"Formatted Accuracy: {results.get('best_val_accuracy', -1.0):.4f}")
-        if 'error' in results:
-             print(f"Training finished with error: {results['error']}")
-        print("-" * 30)
+        trainer = StockPredictorTrainer(test_config)
+        logger.info("Multi-model trainer created successfully.")
     except Exception as e:
-        logger.error(f"Training failed during test: {e}")
+         logger.error(f"Error creating trainer: {e}")
+         import traceback
+         logger.error(traceback.format_exc())
+         return
+
+    # Test training all models
+    logger.info("Starting multi-model training test...")
+    try:
+        results = trainer.train_all_models(train_dataset, val_dataset)
+        
+        print("\n" + "="*80)
+        print("MULTI-MODEL TRAINING COMPLETED")
+        print("="*80)
+        
+        if 'error' not in results:
+            print("\nIndividual Results:")
+            for model_name, result_data in results['individual_results'].items():
+                if 'error' in result_data:
+                    print(f"  {model_name}: FAILED - {result_data['error']}")
+                else:
+                    best_acc = result_data['results'].get('best_val_accuracy', 0)
+                    print(f"  {model_name}: SUCCESS - Best Accuracy: {best_acc:.4f}")
+            
+            print(f"\nSummary:\n{results['summary']}")
+            
+            # Get best model
+            best_name, best_model, best_results = trainer.get_best_model()
+            if best_name:
+                print(f"\nBest Model: {best_name} with accuracy {best_results['best_val_accuracy']:.4f}")
+            
+        else:
+            print(f"Error during multi-model training: {results['error']}")
+            
+        print("="*80)
+        
+    except Exception as e:
+        logger.error(f"Multi-model training failed during test: {e}")
+        import traceback
         logger.error(traceback.format_exc())
 
 

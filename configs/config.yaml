@@ -5,6 +5,9 @@ data:
   # Primary stock symbols to analyze (focused on high-profile tech stocks)
   symbols:
     - "AAPL" # Apple Inc.
+    - "MSFT" # Microsoft Corporation
+    - "NVDA" # NVIDIA Corporation
+    
 
   # Market context indices
   market_indices:
